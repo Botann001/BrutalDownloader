@@ -1,0 +1,11 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Downloader" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/brutalAccent</item>
+        <item name="colorPrimaryVariant">@color/brutalAccent</item>
+        <item name="colorOnPrimary">#FFFFFF</item>
+        <item name="android:statusBarColor">@color/brutalBackground</item>
+        <item name="android:navigationBarColor">@color/brutalBackground</item>
+        <item name="android:windowBackground">@color/brutalBackground</item>
+    </style>
+</resources>

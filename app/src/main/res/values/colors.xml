@@ -1,0 +1,12 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="brutalBackground">#101010</color>
+    <color name="brutalCard">#1A1A1A</color>
+    <color name="brutalAccent">#FF5722</color>
+    <color name="brutalAccentYellow">#FFE600</color>
+    <color name="brutalForeground">#F5F5F5</color>
+    <color name="brutalHint">#777777</color>
+    <color name="brutalBorder">#FF5722</color>
+    <color name="brutalGreen">#00E676</color>
+    <color name="brutalDarkGreen">#004D25</color>
+</resources>
