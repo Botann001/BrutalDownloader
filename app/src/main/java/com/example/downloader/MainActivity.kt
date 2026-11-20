@@ -5,14 +5,18 @@ import android.annotation.SuppressLint
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.pm.PackageManager
-import android.media.MediaScannerConnection
+
+import android.media.MediaExtractor
+import android.media.MediaFormat
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Environment
+
 import android.view.View
 import android.webkit.*
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
@@ -20,12 +24,13 @@ import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
-import java.io.File
-import java.io.FileOutputStream
-import java.net.URLDecoder
+import java.io.IOException
+
 import java.net.URLEncoder
+import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
+import kotlin.coroutines.resume
 
 class MainActivity : AppCompatActivity() {
 
@@ -42,7 +47,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var previewContainer: LinearLayout
     private lateinit var extractorWebView: WebView
 
-    private var isResolvingMedia = false
+    private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+    private var pendingAudioOnly: Boolean? = null
 
     private val platformOptions = arrayOf(
         "AUTO-DETECT",
@@ -53,7 +59,7 @@ class MainActivity : AppCompatActivity() {
     )
 
     private val resolutionOptions = arrayOf(
-        "BEST / MAXIMUM (HD / 1080P)",
+        "BEST / MAXIMUM (AVAILABLE)",
         "HIGH (720P)",
         "MEDIUM (480P)",
         "DATA SAVER (360P)"
@@ -68,10 +74,14 @@ class MainActivity : AppCompatActivity() {
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { isGranted ->
-        if (isGranted) {
-            log("> Izin penyimpanan diberikan.")
-        } else {
-            log("> [!] Izin penyimpanan ditolak.")
+        val audioOnly = pendingAudioOnly
+        pendingAudioOnly = null
+        downloadButton.isEnabled = true
+        downloadAudioButton.isEnabled = true
+        if (isGranted && audioOnly != null) {
+            processDownload(audioOnly)
+        } else if (!isGranted) {
+            log("> [!] Download dibatalkan: izin penyimpanan diperlukan pada Android 9 ke bawah.")
         }
     }
 
@@ -112,7 +122,6 @@ class MainActivity : AppCompatActivity() {
         resolutionSpinner.adapter = resolutionAdapter
 
         setupWebView()
-        checkStoragePermission()
 
         pasteButton.setOnClickListener {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -165,16 +174,16 @@ class MainActivity : AppCompatActivity() {
         return if (matcher.find()) matcher.group(0) ?: "" else input.trim()
     }
 
-    private fun checkStoragePermission() {
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-            if (ContextCompat.checkSelfPermission(
-                    this,
-                    Manifest.permission.WRITE_EXTERNAL_STORAGE
-                ) != PackageManager.PERMISSION_GRANTED
-            ) {
-                requestPermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
-            }
-        }
+    private fun hasStoragePermission(): Boolean =
+        Build.VERSION.SDK_INT > Build.VERSION_CODES.P || ContextCompat.checkSelfPermission(
+            this, Manifest.permission.WRITE_EXTERNAL_STORAGE
+        ) == PackageManager.PERMISSION_GRANTED
+
+    override fun onDestroy() {
+        downloadScope.cancel()
+        client.dispatcher.cancelAll()
+        extractorWebView.destroy()
+        super.onDestroy()
     }
 
     private fun autoSelectPlatform(url: String) {
@@ -217,7 +226,15 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        checkStoragePermission()
+        if (!hasStoragePermission()) {
+            if (pendingAudioOnly == null) {
+                pendingAudioOnly = isAudioOnly
+                downloadButton.isEnabled = false
+                downloadAudioButton.isEnabled = false
+                requestPermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+            return
+        }
 
         val selectedPlatform = sourceSpinner.selectedItem.toString()
         val detectedPlatform = if (selectedPlatform == "AUTO-DETECT") {
@@ -241,50 +258,108 @@ class MainActivity : AppCompatActivity() {
         val selectedResolution = resolutionSpinner.selectedItem.toString()
         log("> [1/3] Memproses: $detectedPlatform [$selectedResolution]\n> URL: $rawUrl")
 
-        CoroutineScope(Dispatchers.IO).launch {
+        downloadScope.launch {
             try {
-                val mediaInfo = when (detectedPlatform) {
-                    "TIKTOK" -> resolveTikTok(rawUrl, isAudioOnly, selectedResolution)
-                    "INSTAGRAM" -> resolveInstagram(rawUrl, isAudioOnly, selectedResolution)
-                    "YOUTUBE" -> resolveYouTube(rawUrl, isAudioOnly, selectedResolution)
-                    else -> MediaResult(
-                        downloadUrl = rawUrl,
-                        fileName = "DirectMedia_" + System.currentTimeMillis() + if (isAudioOnly) ".mp3" else ".mp4"
-                    )
+                val resolved = withContext(Dispatchers.IO) {
+                    when (detectedPlatform) {
+                        "TIKTOK" -> listOf(resolveTikTok(rawUrl, isAudioOnly, selectedResolution))
+                        "INSTAGRAM" -> resolveInstagram(rawUrl, isAudioOnly)
+                        "YOUTUBE" -> listOf(resolveYouTube(rawUrl, isAudioOnly, selectedResolution))
+                        else -> listOf(MediaResult(rawUrl, "DirectMedia", "Kualitas asli tautan; tidak dikonversi."))
+                    }
                 }
-
-                if (mediaInfo == null || mediaInfo.downloadUrl.isEmpty()) {
-                    throw Exception("Gagal mengekstrak tautan media. Pastikan video publik.")
-                }
-
-                appendLog("> [2/3] Stream MP4 OK.\n> Filename: ${mediaInfo.fileName}")
-                appendLog("> [3/3] Mulai mengunduh...")
-
-                downloadStream(mediaInfo.downloadUrl, mediaInfo.fileName)
-
-            } catch (e: Exception) {
-                withContext(Dispatchers.Main) {
-                    progressBar.visibility = View.GONE
+                val selected = if (detectedPlatform == "INSTAGRAM") chooseInstagramItems(resolved) else resolved
+                if (selected == null) {
                     percentTextView.visibility = View.GONE
-                    downloadButton.isEnabled = true
-                    downloadAudioButton.isEnabled = true
-                    log("> [!] ERROR: ${e.message ?: "Unknown error"}")
-                    Toast.makeText(this@MainActivity, "Gagal: ${e.message}", Toast.LENGTH_LONG).show()
+                    log("> Download dibatalkan. Tidak ada file yang diunduh.")
+                    return@launch
                 }
+                val saved = mutableListOf<SavedMedia>()
+                val failures = mutableListOf<String>()
+                selected.forEachIndexed { index, media ->
+                    log("> [2/3] Item ${index + 1}/${selected.size}\n> ${media.qualityDescription}\n> [3/3] Mengunduh dan memvalidasi format asli...")
+                    try {
+                        saved.add(withContext(Dispatchers.IO) {
+                            if (media.downloadUrl.isBlank()) throw IOException("Tautan media tidak tersedia.")
+                            downloadStream(media, isAudioOnly, index + 1, selected.size)
+                        })
+                    } catch (e: CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        failures.add("Item ${media.itemNumber ?: index + 1}: ${e.message ?: "Unknown error"}")
+                    }
+                }
+                percentTextView.text = "${saved.size}/${selected.size} FILE"
+                val heading = when {
+                    failures.isEmpty() -> "> SUCCESS!"
+                    saved.isEmpty() -> "> [!] DOWNLOAD GAGAL"
+                    else -> "> [!] SELESAI SEBAGIAN"
+                }
+                val details = saved.joinToString("\n") { "> ${it.format.uppercase()}: ${it.details}\n  ${it.location}" }
+                val errors = failures.joinToString("\n") { "> [!] $it" }
+                log(listOf(heading, "> Tersimpan ${saved.size}/${selected.size} file di Downloads/BrutalDownloader.", details, errors)
+                    .filter { it.isNotBlank() }.joinToString("\n"))
+                Toast.makeText(this@MainActivity, "Tersimpan ${saved.size}/${selected.size} file", Toast.LENGTH_LONG).show()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                percentTextView.visibility = View.GONE
+                log("> [!] ERROR: ${e.message ?: "Unknown error"}")
+                Toast.makeText(this@MainActivity, "Gagal: ${e.message}", Toast.LENGTH_LONG).show()
+            } finally {
+                progressBar.visibility = View.GONE
+                downloadButton.isEnabled = true
+                downloadAudioButton.isEnabled = true
             }
         }
     }
 
-    private data class MediaResult(val downloadUrl: String, val fileName: String)
+    private data class MediaResult(
+        val downloadUrl: String,
+        val fileStem: String,
+        val qualityDescription: String,
+        val kind: InstagramMediaKind? = null,
+        val itemNumber: Int? = null
+    )
 
-    private fun resolveTikTok(url: String, isAudio: Boolean, resolution: String): MediaResult {
+    private data class SavedMedia(val location: String, val format: String, val details: String)
+
+    private suspend fun chooseInstagramItems(items: List<MediaResult>): List<MediaResult>? {
+        if (items.isEmpty()) throw IOException("Tidak ada foto/video Instagram yang dapat diunduh.")
+        if (items.size == 1) return items
+        progressBar.visibility = View.GONE
+        percentTextView.text = "${items.size} ITEM DITEMUKAN"
+        return suspendCancellableCoroutine { continuation ->
+            val labels = arrayOf("UNDUH SEMUA (${items.size} ITEM)") + items.map {
+                "ITEM ${it.itemNumber}: ${if (it.kind == InstagramMediaKind.PHOTO) "FOTO" else "VIDEO"}"
+            }
+            val dialog = AlertDialog.Builder(this)
+                .setTitle("PILIH MEDIA INSTAGRAM")
+                .setItems(labels) { _, position ->
+                    if (continuation.isActive) {
+                        continuation.resume(if (position == 0) items else listOf(items[position - 1]))
+                    }
+                }
+                .setNegativeButton("BATAL") { _, _ ->
+                    if (continuation.isActive) continuation.resume(null)
+                }
+                .setOnCancelListener {
+                    if (continuation.isActive) continuation.resume(null)
+                }
+                .create()
+            continuation.invokeOnCancellation { runOnUiThread { dialog.dismiss() } }
+            dialog.show()
+        }
+    }
+
+    private suspend fun resolveTikTok(url: String, isAudio: Boolean, resolution: String): MediaResult {
         val apiUrl = "https://www.tikwm.com/api/?url=" + URLEncoder.encode(url, "UTF-8") + "&hd=1"
         val request = Request.Builder()
             .url(apiUrl)
             .header("User-Agent", "Mozilla/5.0")
             .build()
 
-        client.newCall(request).execute().use { response ->
+        withResponse(request) { response ->
             if (!response.isSuccessful) throw Exception("TikWM HTTP ${response.code}")
             val body = response.body?.string() ?: throw Exception("Empty response from TikWM")
             val json = JSONObject(body)
@@ -300,80 +375,29 @@ class MainActivity : AppCompatActivity() {
 
             if (isAudio) {
                 val musicUrl = data.optString("music")
-                return MediaResult(musicUrl, "TikTok_Audio_${title}.mp3")
+                return MediaResult(musicUrl, "TikTok_Audio_$title", "Audio asli dari sumber; format diperiksa saat download.")
             }
 
             val hdPlay = data.optString("hdplay")
             val play = data.optString("play")
 
-            val isBest = resolution.contains("BEST", ignoreCase = true) || resolution.contains("1080", ignoreCase = true)
-            val (videoUrl, qualityTag) = if (isBest && hdPlay.isNotEmpty()) {
-                Pair(hdPlay, "1080p_HD")
+            val useHd = resolution.contains("BEST", ignoreCase = true) && hdPlay.isNotBlank()
+            val videoUrl = if (useHd) hdPlay else play.ifBlank { hdPlay }
+            val description = if (useHd) {
+                "Varian HD dari TikWM; resolusi aktual diperiksa setelah download."
             } else {
-                val tag = if (resolution.contains("360")) "360p" else if (resolution.contains("480")) "480p" else "720p"
-                Pair(play, tag)
+                "Kualitas asli TikWM; pilihan resolusi spesifik tidak tersedia dan tidak dikonversi."
             }
-
-            return MediaResult(videoUrl, "TikTok_${qualityTag}_${title}.mp4")
+            return MediaResult(videoUrl, "TikTok_$title", description)
         }
     }
 
-    private fun baseConvert(d: String, e: Int, f: Int): String {
-        val charset = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ+/"
-        val h = charset.substring(0, e)
-        val i = charset.substring(0, f)
-        var num = 0.0
-        val chars = d.reversed()
-        for (cIdx in chars.indices) {
-            val ch = chars[cIdx]
-            val idx = h.indexOf(ch)
-            if (idx != -1) {
-                num += idx * Math.pow(e.toDouble(), cIdx.toDouble())
-            }
-        }
-        val sb = StringBuilder()
-        var nLong = num.toLong()
-        while (nLong > 0) {
-            val rem = (nLong % f).toInt()
-            sb.insert(0, i[rem])
-            nLong /= f
-        }
-        return if (sb.isEmpty()) "0" else sb.toString()
-    }
 
-    private fun decodeSnapSave(h: String, u: Int, n: String, t: Int, e: Int, r: Int): String {
-        val result = StringBuilder()
-        var i = 0
-        val len = h.length
-        val delimiter = n[e]
-
-        while (i < len) {
-            val sBuilder = StringBuilder()
-            while (i < len && h[i] != delimiter) {
-                sBuilder.append(h[i])
-                i++
-            }
-            var s = sBuilder.toString()
-            for (j in 0 until n.length) {
-                s = s.replace(n[j].toString(), j.toString())
-            }
-            if (s.isNotEmpty()) {
-                val converted = baseConvert(s, e, 10)
-                val codePoint = converted.toLongOrNull() ?: 0L
-                val charVal = (codePoint - t).toInt()
-                result.append(charVal.toChar())
-            }
-            i++
+    private suspend fun resolveInstagram(url: String, isAudioOnly: Boolean): List<MediaResult> {
+        if (isAudioOnly) {
+            throw IOException("Resolver Instagram belum menyediakan audio terpisah. Unduh video; konversi MP3 belum didukung.")
         }
-        return try {
-            URLDecoder.decode(result.toString(), "UTF-8")
-        } catch (_: Exception) {
-            result.toString()
-        }
-    }
-
-    private fun resolveInstagram(url: String, isAudioOnly: Boolean, resolution: String): MediaResult {
-        val cleanUrl = extractCleanUrl(url)
+        val cleanUrl = extractCleanUrl(url).substringBefore('?').substringBefore('#')
         val shortcode = when {
             cleanUrl.contains("/reel/") -> cleanUrl.substringAfter("/reel/").substringBefore("/").substringBefore("?").trim()
             cleanUrl.contains("/p/") -> cleanUrl.substringAfter("/p/").substringBefore("/").substringBefore("?").trim()
@@ -392,197 +416,262 @@ class MainActivity : AppCompatActivity() {
             .post(requestBody)
             .build()
 
-        client.newCall(request).execute().use { response ->
+        withResponse(request) { response ->
             if (!response.isSuccessful) throw Exception("HTTP ${response.code} dari resolver Instagram")
             val body = response.body?.string() ?: throw Exception("Response kosong dari resolver")
 
-            val pattern = Pattern.compile("\\}\\s*\\(\\s*\"(.*?)\"\\s*,\\s*(\\d+)\\s*,\\s*\"(.*?)\"\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*,\\s*(\\d+)\\s*\\)\\s*\\)")
-            val matcher = pattern.matcher(body)
 
-            if (!matcher.find()) {
-                throw Exception("Gagal mengekstrak metadata video Instagram. Pastikan akun dan video publik.")
+            return InstagramMediaParser.parseResponse(body).mapIndexed { index, item ->
+                val kindLabel = if (item.kind == InstagramMediaKind.PHOTO) "Foto asli" else "Video asli"
+                MediaResult(
+                    item.url,
+                    "Instagram_${shortcode}_${(index + 1).toString().padStart(2, '0')}",
+                    "$kindLabel Instagram; tanpa konversi atau perubahan resolusi.",
+                    item.kind,
+                    index + 1
+                )
             }
-
-            val h = matcher.group(1) ?: ""
-            val u = matcher.group(2)?.toIntOrNull() ?: 0
-            val n = matcher.group(3) ?: ""
-            val t = matcher.group(4)?.toIntOrNull() ?: 0
-            val e = matcher.group(5)?.toIntOrNull() ?: 0
-            val r = matcher.group(6)?.toIntOrNull() ?: 0
-
-            val decodedHtml = decodeSnapSave(h, u, n, t, e, r)
-
-            val urlPattern = Pattern.compile("href=\\\\\"?(https://[^\\\\\"]+?)\\\\\"?[ >]")
-            val urlMatcher = urlPattern.matcher(decodedHtml)
-
-            val candidates = mutableListOf<String>()
-            while (urlMatcher.find()) {
-                val candidate = urlMatcher.group(1) ?: ""
-                if (!candidate.contains("google.com") && candidate != "/" && candidate.startsWith("http")) {
-                    candidates.add(candidate)
-                }
-            }
-
-            if (candidates.isEmpty()) {
-                throw Exception("Tautan download video MP4 tidak ditemukan. Akun mungkin privat.")
-            }
-
-            val chosenUrl = if (resolution.contains("360") && candidates.size > 1) {
-                candidates.last()
-            } else {
-                candidates.first()
-            }
-
-            val qualityTag = when {
-                resolution.contains("1080") || resolution.contains("BEST") -> "HD"
-                resolution.contains("720") -> "720p"
-                resolution.contains("480") -> "480p"
-                else -> "360p"
-            }
-
-            val ext = if (isAudioOnly) ".mp3" else ".mp4"
-            val fileName = "Instagram_${qualityTag}_${shortcode}${ext}"
-            return MediaResult(chosenUrl, fileName)
         }
     }
 
-    private fun resolveYouTube(url: String, isAudio: Boolean, resolution: String): MediaResult {
+    private suspend fun resolveYouTube(url: String, isAudio: Boolean, resolution: String): MediaResult {
         val videoId = when {
             url.contains("youtu.be/") -> url.substringAfter("youtu.be/").substringBefore("?").substringBefore("/")
             url.contains("youtube.com/shorts/") -> url.substringAfter("shorts/").substringBefore("?").substringBefore("/")
             url.contains("v=") -> url.substringAfter("v=").substringBefore("&")
-            else -> throw Exception("Tautan YouTube tidak valid")
+            else -> throw IOException("Tautan YouTube tidak valid")
         }
-
         val instances = arrayOf(
             "https://yt.chocolatemoo53.com",
             "https://invidious.nerdvpn.de",
             "https://inv.tux.pizza",
             "https://invidious.jing.rocks"
         )
-
+        var lastFailure: Exception? = null
         for (host in instances) {
+            currentCoroutineContext().ensureActive()
             try {
-                val reqUrl = "$host/api/v1/videos/$videoId"
-                val req = Request.Builder().url(reqUrl).build()
-                client.newCall(req).execute().use { resp ->
-                    if (resp.isSuccessful) {
-                        val body = resp.body?.string() ?: ""
-                        val json = JSONObject(body)
-
-                        if (isAudio) {
-                            val adaptive = json.optJSONArray("adaptiveFormats")
-                            if (adaptive != null) {
-                                for (i in 0 until adaptive.length()) {
-                                    val item = adaptive.getJSONObject(i)
-                                    val type = item.optString("type")
-                                    if (type.contains("audio/mp4") || item.optString("container") == "m4a") {
-                                        return MediaResult(item.getString("url"), "YouTube_Audio_${videoId}.mp3")
-                                    }
-                                }
-                            }
-                        }
-
-                        val formatStreams = json.optJSONArray("formatStreams")
-                        if (formatStreams != null && formatStreams.length() > 0) {
-                            var bestStream = formatStreams.getJSONObject(0).getString("url")
-                            var streamLabel = formatStreams.getJSONObject(0).optString("qualityLabel", "HD")
-
-                            val targetP = when {
-                                resolution.contains("1080") || resolution.contains("BEST") -> "1080"
-                                resolution.contains("720") -> "720"
-                                resolution.contains("480") -> "480"
-                                else -> "360"
-                            }
-
-                            for (i in 0 until formatStreams.length()) {
-                                val item = formatStreams.getJSONObject(i)
-                                val qLabel = item.optString("qualityLabel")
-                                if (qLabel.contains(targetP)) {
-                                    bestStream = item.getString("url")
-                                    streamLabel = qLabel
-                                    break
-                                }
-                            }
-
-                            val ext = if (isAudio) ".mp3" else ".mp4"
-                            return MediaResult(bestStream, "YouTube_${streamLabel}_${videoId}${ext}")
-                        }
+                val req = Request.Builder().url("$host/api/v1/videos/$videoId").build()
+                withResponse(req) { response ->
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code} dari $host")
+                    val json = JSONObject(response.body?.string() ?: throw IOException("Respons kosong"))
+                    val formats = json.optJSONArray(if (isAudio) "adaptiveFormats" else "formatStreams")
+                        ?: throw IOException("Daftar stream tidak tersedia dari $host")
+                    val candidates = (0 until formats.length()).map { formats.getJSONObject(it) }
+                        .filter { it.optString("url").isNotBlank() }
+                    if (isAudio) {
+                        val audio = candidates.filter {
+                            it.optString("type").startsWith("audio/mp4") ||
+                                it.optString("type").startsWith("audio/webm") ||
+                                it.optString("container") == "m4a"
+                        }.maxByOrNull { it.optLong("bitrate", 0) }
+                            ?: throw IOException("Audio terpisah tidak tersedia dari $host; video tidak akan disimpan sebagai MP3.")
+                        return MediaResult(audio.getString("url"), "YouTube_Audio_$videoId", "Audio asli; bukan konversi MP3.")
                     }
+                    val videos = candidates.mapNotNull { item ->
+                        val type = item.optString("type")
+                        val container = item.optString("container")
+                        val height = Regex("(\\d+)p").find(item.optString("qualityLabel"))
+                            ?.groupValues?.get(1)?.toIntOrNull() ?: item.optInt("height", 0)
+                        if (height > 0 && (type.startsWith("video/mp4") || container == "mp4")) {
+                            height to item.getString("url")
+                        } else null
+                    }
+                    val targetHeight = when {
+                        resolution.contains("BEST") -> null
+                        resolution.contains("720") -> 720
+                        resolution.contains("480") -> 480
+                        else -> 360
+                    }
+                    val selectedHeight = MediaDownloadPolicy.selectVideoHeight(videos.map { it.first }, targetHeight)
+                    val selectedUrl = videos.first { it.first == selectedHeight }.second
+                    val description = if (targetHeight != null && selectedHeight != targetHeight) {
+                        "${targetHeight}p tidak tersedia; memilih ${selectedHeight}p menurut metadata sumber."
+                    } else {
+                        "Memilih ${selectedHeight}p menurut metadata sumber; resolusi aktual akan diverifikasi."
+                    }
+                    return MediaResult(selectedUrl, "YouTube_$videoId", description)
                 }
-            } catch (_: Exception) {}
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                currentCoroutineContext().ensureActive()
+                lastFailure = e
+            }
         }
-
-        throw Exception("Gagal mengekstrak YouTube. Coba link YouTube Shorts atau video lain.")
+        throw IOException("Gagal mengekstrak YouTube: ${lastFailure?.message ?: "stream tidak tersedia"}", lastFailure)
     }
 
-    private suspend fun downloadStream(downloadUrl: String, fileName: String) {
-        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        if (!downloadsDir.exists()) downloadsDir.mkdirs()
+    private suspend inline fun <T> withResponse(request: Request, block: (okhttp3.Response) -> T): T {
+        val call = client.newCall(request)
+        // execute()/stream reads block IO threads; a sibling job cancels the socket on cancellation.
+        val cancellationWatcher = CoroutineScope(currentCoroutineContext()).launch(start = CoroutineStart.UNDISPATCHED) {
+            try {
+                awaitCancellation()
+            } finally {
+                call.cancel()
+            }
+        }
+        return try {
+            currentCoroutineContext().ensureActive()
+            call.execute().use(block)
+        } finally {
+            cancellationWatcher.cancel()
+        }
+    }
 
-        val targetFile = File(downloadsDir, fileName)
-
+    private suspend fun downloadStream(
+        media: MediaResult,
+        audioOnly: Boolean,
+        itemPosition: Int,
+        itemCount: Int
+    ): SavedMedia {
         val request = Request.Builder()
-            .url(downloadUrl)
+            .url(media.downloadUrl)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
             .build()
-
-        client.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) throw Exception("HTTP ${response.code}: Gagal mengunduh stream.")
-            val body = response.body ?: throw Exception("Response body null.")
-
+        withResponse(request) { response ->
+            if (response.code != 200) throw IOException("HTTP ${response.code}: stream lengkap tidak tersedia.")
+            val body = response.body ?: throw IOException("Respons media kosong.")
             val contentLength = body.contentLength()
-            var bytesCopied: Long = 0
-
-            withContext(Dispatchers.Main) {
-                progressBar.isIndeterminate = (contentLength <= 0)
-                if (contentLength > 0) {
-                    progressBar.max = 100
+            body.byteStream().buffered().use { input ->
+                input.mark(4096)
+                val header = ByteArray(4096)
+                var headerSize = 0
+                while (headerSize < header.size) {
+                    currentCoroutineContext().ensureActive()
+                    val count = input.read(header, headerSize, header.size - headerSize)
+                    if (count == -1) break
+                    headerSize += count
                 }
-            }
-
-            body.byteStream().use { input ->
-                FileOutputStream(targetFile).use { output ->
-                    val buffer = ByteArray(8 * 1024)
-                    var bytes = input.read(buffer)
-                    var lastUpdate = System.currentTimeMillis()
-
-                    while (bytes >= 0) {
-                        output.write(buffer, 0, bytes)
-                        bytesCopied += bytes
-
-                        val now = System.currentTimeMillis()
-                        if (now - lastUpdate > 250 && contentLength > 0) {
-                            lastUpdate = now
-                            val progress = ((bytesCopied * 100) / contentLength).toInt()
-                            withContext(Dispatchers.Main) {
-                                progressBar.progress = progress
-                                percentTextView.text = "$progress%"
-                                statusTextView.text = "> DOWNLOADING: $progress%\n> ${(bytesCopied / 1024)} KB / ${(contentLength / 1024)} KB"
+                input.reset()
+                val format = MediaDownloadPolicy.detectFormat(header.copyOf(headerSize), audioOnly)
+                if (media.kind == InstagramMediaKind.PHOTO && !format.mimeType.startsWith("image/")) {
+                    throw IOException("Item Instagram ditandai sebagai foto tetapi sumber tidak mengirim gambar yang didukung.")
+                }
+                if (media.kind == InstagramMediaKind.VIDEO && !format.mimeType.startsWith("video/")) {
+                    throw IOException("Item Instagram ditandai sebagai video tetapi sumber tidak mengirim video yang didukung.")
+                }
+                val fileName = "${media.fileStem}.${format.extension}"
+                currentCoroutineContext().ensureActive()
+                DownloadStorage(this@MainActivity).create(fileName, format.mimeType).use { pending ->
+                    withContext(Dispatchers.Main) {
+                        progressBar.visibility = View.VISIBLE
+                        progressBar.isIndeterminate = contentLength <= 0
+                        progressBar.max = 100
+                        progressBar.progress = 0
+                        percentTextView.text = "$itemPosition/$itemCount DOWNLOADING..."
+                    }
+                    var bytesCopied = 0L
+                    var lastUpdate = 0L
+                    pending.outputStream.use { output ->
+                        val buffer = ByteArray(8 * 1024)
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+                            val count = input.read(buffer)
+                            if (count == -1) break
+                            output.write(buffer, 0, count)
+                            bytesCopied += count
+                            val now = System.currentTimeMillis()
+                            if (now - lastUpdate > 250) {
+                                lastUpdate = now
+                                withContext(Dispatchers.Main) {
+                                    val progress = if (contentLength > 0) {
+                                        ((bytesCopied.toDouble() / contentLength) * 100).toInt().coerceIn(0, 100)
+                                    } else null
+                                    if (progress != null) progressBar.progress = progress
+                                    percentTextView.text = "$itemPosition/$itemCount " + (progress?.let { "$it%" } ?: "${bytesCopied / 1024} KB")
+                                    statusTextView.text = "> ITEM $itemPosition/$itemCount: ${bytesCopied / 1024} KB\n> Format: ${format.extension.uppercase()}\n> ${media.qualityDescription}"
+                                }
                             }
                         }
-
-                        bytes = input.read(buffer)
                     }
+                    MediaDownloadPolicy.requireComplete(contentLength, bytesCopied)
+                    currentCoroutineContext().ensureActive()
+                    withContext(Dispatchers.Main) { percentTextView.text = "VALIDATING..." }
+                    val actualQuality = if (format.mimeType.startsWith("image/")) {
+                        ImageMediaValidator.validate(this@MainActivity, pending.uri, format)
+                    } else {
+                        validateMedia(pending.uri, format, audioOnly)
+                    }
+                    currentCoroutineContext().ensureActive()
+                    val location = pending.publish()
+                    return SavedMedia(location, format.extension, actualQuality)
                 }
             }
+        }
+    }
 
-            // Scan to Android MediaStore so it appears in Gallery/Videos
-            MediaScannerConnection.scanFile(
-                this@MainActivity,
-                arrayOf(targetFile.absolutePath),
-                null
-            ) { _, _ -> }
 
-            withContext(Dispatchers.Main) {
-                progressBar.visibility = View.GONE
-                percentTextView.visibility = View.VISIBLE
-                percentTextView.text = "100% DONE"
-                downloadButton.isEnabled = true
-                downloadAudioButton.isEnabled = true
-                log("> SUCCESS!\n> File Tersimpan di:\n  ${targetFile.absolutePath}\n> Buka aplikasi Galeri / File Manager!")
-                Toast.makeText(this@MainActivity, "Download Selesai!\nTersimpan di Downloads", Toast.LENGTH_LONG).show()
+    private fun validateMedia(uri: Uri, format: DownloadFormat, audioOnly: Boolean): String {
+        val extractor = MediaExtractor()
+        try {
+            contentResolver.openFileDescriptor(uri, "r").use { descriptor ->
+                if (descriptor == null) throw IOException("File download tidak dapat diperiksa.")
+                extractor.setDataSource(descriptor.fileDescriptor)
+                var hasAudio = false
+                var hasVideo = false
+                var dimensions: String? = null
+                val audioMimes = mutableSetOf<String>()
+                for (index in 0 until extractor.trackCount) {
+                    val track = extractor.getTrackFormat(index)
+                    val mime = track.getString(MediaFormat.KEY_MIME).orEmpty()
+                    if (mime.startsWith("audio/")) {
+                        hasAudio = true
+                        audioMimes.add(mime)
+                    }
+                    if (mime.startsWith("video/")) {
+                        hasVideo = true
+                        if (track.containsKey(MediaFormat.KEY_WIDTH) && track.containsKey(MediaFormat.KEY_HEIGHT)) {
+                            dimensions = "${track.getInteger(MediaFormat.KEY_WIDTH)} × ${track.getInteger(MediaFormat.KEY_HEIGHT)}"
+                        }
+                    }
+                    if (mime.startsWith("audio/") || mime.startsWith("video/")) {
+                        extractor.selectTrack(index)
+                        try {
+                            val sampleSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) extractor.sampleSize else -1L
+                            val bufferSize = if (sampleSize > 0) sampleSize else {
+                                if (track.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                                    track.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).toLong()
+                                } else 8L * 1024 * 1024
+                            }
+                            if (extractor.sampleTime < 0 || bufferSize !in 1L..32L * 1024 * 1024) {
+                                throw IOException("Sampel media kosong, rusak, atau terlalu besar.")
+                            }
+                            val read = extractor.readSampleData(ByteBuffer.allocate(bufferSize.toInt()), 0)
+                            if (read <= 0 || (sampleSize > 0 && read.toLong() != sampleSize)) {
+                                throw IOException("Sampel media tidak lengkap. Coba unduh ulang.")
+                            }
+                        } finally {
+                            extractor.unselectTrack(index)
+                        }
+                    }
+                }
+                if (!hasAudio && !hasVideo) throw IOException("Respons tidak berisi track audio/video yang valid.")
+                if (format.extension == "mp3" && audioMimes != setOf("audio/mpeg")) {
+                    throw IOException("Isi audio bukan MP3 meskipun memiliki metadata ID3; file tidak disimpan dengan ekstensi yang salah.")
+                }
+                if (format.mimeType.startsWith("audio/") && hasVideo) {
+                    throw IOException("Container audio ternyata berisi video; respons sumber tidak sesuai.")
+                }
+                if (audioOnly && (!hasAudio || hasVideo)) {
+                    throw IOException("Sumber tidak menyediakan audio terpisah. Video tidak akan diganti ekstensi menjadi audio.")
+                }
+                if (!audioOnly && format.mimeType.startsWith("video/") && !hasVideo) {
+                    throw IOException("Sumber hanya berisi audio. Gunakan tombol audio agar format disimpan dengan benar.")
+                }
+                return if (hasVideo) {
+                    "Resolusi aktual: ${dimensions ?: "tidak tersedia"}"
+                } else {
+                    "Audio asli terverifikasi; tanpa konversi MP3."
+                }
             }
+        } catch (e: IOException) {
+            throw e
+        } catch (e: Exception) {
+            throw IOException("Format media tidak valid atau tidak didukung perangkat ini.", e)
+        } finally {
+            extractor.release()
         }
     }
 }
