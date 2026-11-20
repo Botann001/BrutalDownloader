@@ -21,8 +21,10 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import okhttp3.FormBody
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.IOException
 
@@ -416,21 +418,55 @@ class MainActivity : AppCompatActivity() {
             .post(requestBody)
             .build()
 
-        withResponse(request) { response ->
-            if (!response.isSuccessful) throw Exception("HTTP ${response.code} dari resolver Instagram")
-            val body = response.body?.string() ?: throw Exception("Response kosong dari resolver")
-
-
-            return InstagramMediaParser.parseResponse(body).mapIndexed { index, item ->
-                val kindLabel = if (item.kind == InstagramMediaKind.PHOTO) "Foto asli" else "Video asli"
-                MediaResult(
-                    item.url,
-                    "Instagram_${shortcode}_${(index + 1).toString().padStart(2, '0')}",
-                    "$kindLabel Instagram; tanpa konversi atau perubahan resolusi.",
-                    item.kind,
-                    index + 1
-                )
+        var usedFallback = false
+        val items = withResponse(request) { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} dari resolver Instagram")
+            val body = response.body?.string() ?: throw IOException("Respons kosong dari resolver Instagram")
+            try {
+                InstagramMediaParser.parseResponse(body)
+            } catch (error: IOException) {
+                // A successful resolver response can contain a download button without a media URL.
+                null
             }
+        } ?: run {
+            usedFallback = true
+            withContext(Dispatchers.Main) {
+                log("> [!] SnapSave tidak menyediakan tautan valid; mencoba resolver cadangan curl-x.com.")
+            }
+            resolveInstagramFallback(cleanUrl)
+        }
+        return items.mapIndexed { index, item ->
+            val kindLabel = if (item.kind == InstagramMediaKind.PHOTO) "Foto" else "Video"
+            val description = if (usedFallback) {
+                "$kindLabel Instagram dari resolver cadangan; kualitas sesuai sumber, tanpa konversi."
+            } else {
+                "$kindLabel asli Instagram; tanpa konversi atau perubahan resolusi."
+            }
+            MediaResult(
+                item.url,
+                "Instagram_${shortcode}_${(index + 1).toString().padStart(2, '0')}",
+                description,
+                item.kind,
+                index + 1
+            )
+        }
+    }
+
+    private suspend fun resolveInstagramFallback(url: String): List<InstagramMediaItem> {
+        val request = Request.Builder()
+            .url("https://www.curl-x.com/api/extract")
+            .header("User-Agent", "Mozilla/5.0")
+            .post(JSONObject().put("url", url).toString().toRequestBody("application/json".toMediaType()))
+            .build()
+        return withResponse(request) { response ->
+            if (!response.isSuccessful) {
+                val reason = if (response.code == 429) "Batas permintaan tercapai; tunggu lalu coba lagi." else
+                    "HTTP ${response.code}; coba lagi nanti."
+                throw IOException("SnapSave tidak menyediakan tautan video. Resolver cadangan gagal: $reason")
+            }
+            val body = response.body?.string()
+                ?: throw IOException("Respons resolver Instagram cadangan kosong; coba lagi nanti.")
+            InstagramFallbackParser.parseResponse(body, url)
         }
     }
 

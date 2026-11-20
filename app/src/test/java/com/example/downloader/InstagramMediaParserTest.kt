@@ -138,6 +138,18 @@ class InstagramMediaParserTest {
     }
 
     @Test
+    fun rejectsBrokenSnapSaveReelButtonWithoutDownloadingItsThumbnail() {
+        val html = """
+            <div class="download-items">
+                <img src="https://cdn.example/reel-thumbnail.jpg">
+                <a onclick="showAd();" href="&dl=1" title="Download Photo"><span>Download video</span></span></a>
+            </div>
+        """.trimIndent()
+        val script = "document.getElementById(\"download-section\").innerHTML = ${jsString(html)};"
+        expectIo { InstagramMediaParser.parseResponse(pack(script)) }
+    }
+
+    @Test
     fun rejectsUnsafeRelativeMalformedAndNonNetworkHrefs() {
         for (url in listOf("/photo.jpg", "//cdn.example/p", "javascript:alert(1)", "data:image/jpeg,x", "ftp://cdn.example/p", "https:///p", "https://cdn.example/a b", "https://user@cdn.example/p", "https://cdn.example/%zz")) {
             expectIo { InstagramMediaParser.parseDecodedHtml("<a href='$url'>Download Photo</a>") }

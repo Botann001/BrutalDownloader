@@ -18,7 +18,9 @@ Download public videos and reels from **TikTok**, **Instagram**, and **YouTube**
   - For carousels, choose one numbered item or download all in source order. Per-item failures are reported without discarding successful downloads.
   - Detects JPEG, PNG, WebP, and GIF by their signatures, validates image decoding, and keeps the original format and dimensions. Resolution preferences do not resize photos.
   - Downloads the original source stream without transcoding or guaranteeing a specific codec.
-  - The current resolver does not provide standalone audio or resolution metadata.
+  - Uses SnapSave first. If its successful response has no valid download links, tries curl-x.com once for MP4 videos. The fallback does not substitute thumbnails, return partial mixed carousels, or guarantee original/maximum quality.
+  - Submitted post URLs are shared with these third-party resolvers (curl-x.com only when fallback is needed). Availability and rate limits depend on the providers; HTTP 429 requires waiting before retrying.
+  - The resolvers do not provide standalone audio or reliable resolution metadata.
 - **YouTube Downloader:**
   - Selects progressive MP4 video formats and standalone MP4/WebM audio when available; never falls back to video for an audio request.
 - **Resolution Selector:** For YouTube, BEST chooses the largest reported height; other preferences choose the highest available height at or below the target, or the lowest available height if none fit. Fallbacks are reported. TikTok/Instagram do not guarantee exact resolutions. Completed videos show their actual dimensions, not a guessed quality label.
@@ -50,6 +52,10 @@ cd BrutalDownloader
 ```
 
 The debug APK will be generated at `app/build/outputs/apk/debug/app-debug.apk`.
+
+## Windows Desktop
+
+A separate Python/PySide6 desktop client is available in [`desktop/`](desktop/README.md), with Windows x64 portable packaging, media selection, progress, cancellation, and native audio downloads. It does not change the Android build. See the desktop README for setup, resolver/privacy limitations, tests, and `.exe` build instructions.
 
 ## Validation
 
