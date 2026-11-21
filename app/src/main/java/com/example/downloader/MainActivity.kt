@@ -665,18 +665,18 @@ class MainActivity : AppCompatActivity() {
                     if (mime.startsWith("audio/") || mime.startsWith("video/")) {
                         extractor.selectTrack(index)
                         try {
-                            val sampleSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) extractor.sampleSize else -1L
-                            val bufferSize = if (sampleSize > 0) sampleSize else {
-                                if (track.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
-                                    track.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE).toLong()
-                                } else 8L * 1024 * 1024
-                            }
-                            if (extractor.sampleTime < 0 || bufferSize !in 1L..32L * 1024 * 1024) {
-                                throw IOException("Sampel media kosong, rusak, atau terlalu besar.")
-                            }
-                            val read = extractor.readSampleData(ByteBuffer.allocate(bufferSize.toInt()), 0)
-                            if (read <= 0 || (sampleSize > 0 && read.toLong() != sampleSize)) {
-                                throw IOException("Sampel media tidak lengkap. Coba unduh ulang.")
+                            extractor.seekTo(0, MediaExtractor.SEEK_TO_CLOSEST_SYNC)
+                            val maxInput = if (track.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+                                track.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+                            } else 0
+                            val sampleSize = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                                extractor.sampleSize.toInt()
+                            } else -1
+                            val bufferCapacity = maxOf(maxInput, sampleSize, 64 * 1024).coerceIn(64 * 1024, 32 * 1024 * 1024)
+                            val buffer = ByteBuffer.allocate(bufferCapacity)
+                            val read = extractor.readSampleData(buffer, 0)
+                            if (read <= 0 && extractor.sampleTrackIndex < 0) {
+                                throw IOException("Sampel media kosong, rusak, atau trek tidak valid.")
                             }
                         } finally {
                             extractor.unselectTrack(index)
