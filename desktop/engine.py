@@ -88,7 +88,7 @@ def _platform(options):
     _url(options.url)
     if options.quality not in ('BEST', '720', '480', '360'):
         raise DownloadError('Unsupported quality')
-    if options.platform not in ('AUTO-DETECT', 'TIKTOK', 'INSTAGRAM', 'YOUTUBE', 'DIRECT LINK'):
+    if options.platform not in ('AUTO-DETECT', 'TIKTOK', 'INSTAGRAM', 'YOUTUBE', 'TWITTER / X', 'FACEBOOK', 'DIRECT LINK'):
         raise DownloadError('Unsupported platform')
     host = urlsplit(options.url).hostname.lower()
     detected = 'DIRECT LINK'
@@ -96,6 +96,8 @@ def _platform(options):
         ('INSTAGRAM', ('instagram.com',)),
         ('YOUTUBE', ('youtube.com', 'youtu.be', 'youtube-nocookie.com')),
         ('TIKTOK', ('tiktok.com',)),
+        ('TWITTER / X', ('twitter.com', 'x.com')),
+        ('FACEBOOK', ('facebook.com', 'fb.watch', 'fb.com')),
     ):
         if any(host == domain or host.endswith('.' + domain) for domain in domains):
             detected = platform

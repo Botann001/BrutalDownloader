@@ -70,6 +70,8 @@ class MainActivity : AppCompatActivity() {
         "TIKTOK",
         "INSTAGRAM",
         "YOUTUBE",
+        "TWITTER / X",
+        "FACEBOOK",
         "DIRECT LINK"
     )
 
@@ -225,8 +227,14 @@ class MainActivity : AppCompatActivity() {
             lower.contains("youtube.com") || lower.contains("youtu.be") -> {
                 sourceSpinner.setSelection(3) // YOUTUBE
             }
+            lower.contains("twitter.com") || lower.contains("x.com") -> {
+                sourceSpinner.setSelection(4) // TWITTER / X
+            }
+            lower.contains("facebook.com") || lower.contains("fb.watch") || lower.contains("fb.com") -> {
+                sourceSpinner.setSelection(5) // FACEBOOK
+            }
             lower.endsWith(".mp4") || lower.endsWith(".mp3") || lower.endsWith(".jpg") -> {
-                sourceSpinner.setSelection(4) // DIRECT LINK
+                sourceSpinner.setSelection(6) // DIRECT LINK
             }
         }
     }
@@ -269,6 +277,8 @@ class MainActivity : AppCompatActivity() {
                 rawUrl.contains("tiktok.com") || rawUrl.contains("douyin.com") -> "TIKTOK"
                 rawUrl.contains("instagram.com") || rawUrl.contains("instagr.am") -> "INSTAGRAM"
                 rawUrl.contains("youtube.com") || rawUrl.contains("youtu.be") -> "YOUTUBE"
+                rawUrl.contains("twitter.com") || rawUrl.contains("x.com") -> "TWITTER / X"
+                rawUrl.contains("facebook.com") || rawUrl.contains("fb.watch") || rawUrl.contains("fb.com") -> "FACEBOOK"
                 else -> "DIRECT LINK"
             }
         } else {
@@ -292,10 +302,12 @@ class MainActivity : AppCompatActivity() {
                         "TIKTOK" -> listOf(resolveTikTok(rawUrl, isAudioOnly, selectedResolution))
                         "INSTAGRAM" -> resolveInstagram(rawUrl, isAudioOnly)
                         "YOUTUBE" -> listOf(resolveYouTube(rawUrl, isAudioOnly, selectedResolution))
+                        "TWITTER / X" -> resolveTwitter(rawUrl, isAudioOnly, selectedResolution)
+                        "FACEBOOK" -> resolveFacebook(rawUrl, isAudioOnly, selectedResolution)
                         else -> listOf(MediaResult(rawUrl, "DirectMedia", "Kualitas asli tautan; tidak dikonversi."))
                     }
                 }
-                val selected = if (detectedPlatform == "INSTAGRAM") chooseInstagramItems(resolved) else resolved
+                val selected = if (resolved.size > 1) chooseMediaItems(resolved, detectedPlatform) else resolved
                 if (selected == null) {
                     percentTextView.visibility = View.GONE
                     log("> Download dibatalkan. Tidak ada file yang diunduh.")
@@ -360,8 +372,8 @@ class MainActivity : AppCompatActivity() {
         val uri: Uri? = null
     )
 
-    private suspend fun chooseInstagramItems(items: List<MediaResult>): List<MediaResult>? {
-        if (items.isEmpty()) throw IOException("Tidak ada foto/video Instagram yang dapat diunduh.")
+    private suspend fun chooseMediaItems(items: List<MediaResult>, platformName: String): List<MediaResult>? {
+        if (items.isEmpty()) throw IOException("Tidak ada foto/video $platformName yang dapat diunduh.")
         if (items.size == 1) return items
         progressBar.visibility = View.GONE
         percentTextView.text = "${items.size} ITEM DITEMUKAN"
@@ -370,7 +382,7 @@ class MainActivity : AppCompatActivity() {
                 "ITEM ${it.itemNumber}: ${if (it.kind == InstagramMediaKind.PHOTO) "FOTO" else "VIDEO"}"
             }
             val dialog = AlertDialog.Builder(this)
-                .setTitle("PILIH MEDIA INSTAGRAM")
+                .setTitle("PILIH MEDIA $platformName")
                 .setItems(labels) { _, position ->
                     if (continuation.isActive) {
                         continuation.resume(if (position == 0) items else listOf(items[position - 1]))
@@ -385,6 +397,264 @@ class MainActivity : AppCompatActivity() {
                 .create()
             continuation.invokeOnCancellation { runOnUiThread { dialog.dismiss() } }
             dialog.show()
+        }
+    }
+
+    private suspend fun resolveTwitter(url: String, isAudioOnly: Boolean, resolution: String): List<MediaResult> {
+        val cleanUrl = extractCleanUrl(url)
+        val tweetId = Regex("""status(?:es)?/(\d+)""").find(cleanUrl)?.groupValues?.get(1)
+            ?: throw IOException("Tautan Twitter / X tidak valid. Pastikan berisi tautan postingan/status.")
+
+        val endpoints = listOf(
+            "https://api.vxtwitter.com/Twitter/status/$tweetId",
+            "https://api.fxtwitter.com/2/status/$tweetId"
+        )
+        var lastException: Exception? = null
+
+        for (apiUrl in endpoints) {
+            currentCoroutineContext().ensureActive()
+            try {
+                val request = Request.Builder()
+                    .url(apiUrl)
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+                    .build()
+
+                return withResponse(request) { response ->
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code} dari $apiUrl")
+                    val body = response.body?.string() ?: throw IOException("Respons kosong dari $apiUrl")
+                    val json = JSONObject(body)
+
+                    // 1. Check vxtwitter media_extended
+                    val mediaExtended = json.optJSONArray("media_extended")
+                    if (mediaExtended != null && mediaExtended.length() > 0) {
+                        val results = mutableListOf<MediaResult>()
+                        for (i in 0 until mediaExtended.length()) {
+                            val item = mediaExtended.getJSONObject(i)
+                            val itemUrl = item.optString("url")
+                            if (itemUrl.isEmpty()) continue
+                            val itemType = item.optString("type").lowercase()
+                            val sizeObj = item.optJSONObject("size")
+                            val w = sizeObj?.optInt("width", 0) ?: 0
+                            val h = sizeObj?.optInt("height", 0) ?: 0
+                            val isVideo = itemType == "video" || itemType == "gif"
+                            val kind = if (isVideo) InstagramMediaKind.VIDEO else InstagramMediaKind.PHOTO
+                            val desc = if (isVideo) {
+                                if (w > 0 && h > 0) "Video Twitter/X [${w}x${h}]" else "Video Twitter/X [HD]"
+                            } else {
+                                "Foto Twitter/X [Original Quality]"
+                            }
+                            val prefix = if (isVideo) "Twitter_${tweetId}" else "Twitter_${tweetId}_photo"
+                            results.add(
+                                MediaResult(
+                                    itemUrl,
+                                    "${prefix}_${(i + 1).toString().padStart(2, '0')}",
+                                    desc,
+                                    kind,
+                                    i + 1
+                                )
+                            )
+                        }
+                        if (results.isNotEmpty()) return@withResponse results
+                    }
+
+                    // 2. Check fxtwitter status.media or tweet.media
+                    val status = json.optJSONObject("status") ?: json.optJSONObject("tweet") ?: json
+                    val media = status.optJSONObject("media")
+                        ?: throw IOException("Postingan Twitter/X ini tidak memiliki media video atau foto.")
+
+                    val videos = media.optJSONArray("videos")
+                    if (videos != null && videos.length() > 0) {
+                        val results = mutableListOf<MediaResult>()
+                        for (i in 0 until videos.length()) {
+                            val v = videos.getJSONObject(i)
+                            val formats = v.optJSONArray("formats") ?: v.optJSONArray("variants")
+                            var chosenUrl = v.optString("url")
+                            var chosenDesc = "Video Twitter/X [Original Quality]"
+
+                            if (formats != null && formats.length() > 0) {
+                                val mp4List = (0 until formats.length()).map { formats.getJSONObject(it) }
+                                    .filter {
+                                        val c = it.optString("container").lowercase()
+                                        val ct = it.optString("content_type").lowercase()
+                                        val u = it.optString("url").lowercase()
+                                        c == "mp4" || ct == "video/mp4" || u.contains(".mp4")
+                                    }
+                                if (mp4List.isNotEmpty()) {
+                                    val sorted = mp4List.sortedByDescending { it.optLong("bitrate", 0) }
+                                    val selected = when {
+                                        resolution.contains("BEST") -> sorted.first()
+                                        resolution.contains("480") || resolution.contains("360") -> sorted.last()
+                                        resolution.contains("720") -> sorted.firstOrNull { it.optInt("height", 0) <= 720 } ?: sorted.first()
+                                        else -> sorted.first()
+                                    }
+                                    chosenUrl = selected.optString("url", chosenUrl)
+                                    val bitrate = selected.optLong("bitrate", 0)
+                                    val width = selected.optInt("width", 0)
+                                    val height = selected.optInt("height", 0)
+                                    chosenDesc = when {
+                                        width > 0 && height > 0 -> "Video Twitter/X [${width}x${height}]"
+                                        bitrate > 0 -> "Video Twitter/X [${bitrate / 1000} kbps]"
+                                        else -> "Video Twitter/X"
+                                    }
+                                }
+                            }
+                            results.add(
+                                MediaResult(
+                                    chosenUrl,
+                                    "Twitter_${tweetId}_${(i + 1).toString().padStart(2, '0')}",
+                                    chosenDesc,
+                                    InstagramMediaKind.VIDEO,
+                                    i + 1
+                                )
+                            )
+                        }
+                        if (results.isNotEmpty()) return@withResponse results
+                    }
+
+                    // Photos in tweet
+                    val photos = media.optJSONArray("photos")
+                    if (photos != null && photos.length() > 0) {
+                        val results = mutableListOf<MediaResult>()
+                        for (i in 0 until photos.length()) {
+                            val p = photos.getJSONObject(i)
+                            val photoUrl = p.optString("url")
+                            results.add(
+                                MediaResult(
+                                    photoUrl,
+                                    "Twitter_${tweetId}_photo_${(i + 1).toString().padStart(2, '0')}",
+                                    "Foto Twitter/X [Original Quality]",
+                                    InstagramMediaKind.PHOTO,
+                                    i + 1
+                                )
+                            )
+                        }
+                        return@withResponse results
+                    }
+
+                    throw IOException("Tidak ditemukan video atau foto pada postingan Twitter/X ini.")
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                lastException = e
+            }
+        }
+
+        // Fallback: TwitSave
+        return try {
+            resolveTwitterTwitSaveFallback(cleanUrl, tweetId)
+        } catch (e: Exception) {
+            throw IOException("Gagal mengekstrak Twitter/X: ${lastException?.message ?: e.message}", lastException ?: e)
+        }
+    }
+
+    private suspend fun resolveTwitterTwitSaveFallback(url: String, tweetId: String): List<MediaResult> {
+        val encodedUrl = URLEncoder.encode(url, "UTF-8")
+        val request = Request.Builder()
+            .url("https://twitsave.com/info?url=$encodedUrl")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+            .build()
+        return withResponse(request) { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} dari TwitSave")
+            val html = response.body?.string().orEmpty()
+            val links = Regex("""href=["'](https://video\.twimg\.com/[^"']+)["']""").findAll(html)
+                .map { it.groupValues[1] }
+                .distinct()
+                .toList()
+            if (links.isEmpty()) throw IOException("TwitSave tidak menemukan tautan video.")
+            val chosen = links.first()
+            listOf(
+                MediaResult(
+                    chosen,
+                    "Twitter_${tweetId}_01",
+                    "Video Twitter/X dari TwitSave; kualitas asli.",
+                    InstagramMediaKind.VIDEO,
+                    1
+                )
+            )
+        }
+    }
+
+    private suspend fun resolveFacebook(url: String, isAudioOnly: Boolean, resolution: String): List<MediaResult> {
+        val cleanUrl = extractCleanUrl(url)
+        val shortcode = when {
+            cleanUrl.contains("/watch") -> cleanUrl.substringAfter("v=").substringBefore("&").substringBefore("?").trim()
+            cleanUrl.contains("/reel/") -> cleanUrl.substringAfter("/reel/").substringBefore("/").substringBefore("?").trim()
+            cleanUrl.contains("/videos/") -> cleanUrl.substringAfter("/videos/").substringBefore("/").substringBefore("?").trim()
+            else -> "fb_" + System.currentTimeMillis()
+        }
+
+        val requestBody = FormBody.Builder()
+            .add("url", cleanUrl)
+            .build()
+
+        val request = Request.Builder()
+            .url("https://snapsave.app/action.php")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36")
+            .header("Referer", "https://snapsave.app/")
+            .header("Origin", "https://snapsave.app")
+            .post(requestBody)
+            .build()
+
+        var usedFallback = false
+        val items = withResponse(request) { response ->
+            if (!response.isSuccessful) throw IOException("HTTP ${response.code} dari resolver Facebook")
+            val body = response.body?.string() ?: throw IOException("Respons kosong dari resolver Facebook")
+            try {
+                InstagramMediaParser.parseResponse(body)
+            } catch (error: IOException) {
+                null
+            }
+        } ?: run {
+            usedFallback = true
+            withContext(Dispatchers.Main) {
+                log("> [!] SnapSave gagal; mencoba resolver cadangan Facebook.")
+            }
+            resolveFacebookFallback(cleanUrl)
+        }
+
+        val selectedItems = if (items.size > 1 && !resolution.contains("BEST") && resolution.contains("360")) {
+            listOf(items.last())
+        } else {
+            items
+        }
+
+        return selectedItems.mapIndexed { index, item ->
+            val kindLabel = if (item.kind == InstagramMediaKind.PHOTO) "Foto" else "Video"
+            val description = if (usedFallback) {
+                "$kindLabel Facebook dari resolver cadangan; kualitas asli."
+            } else {
+                "$kindLabel Facebook; kualitas asli tanpa re-encode."
+            }
+            MediaResult(
+                item.url,
+                "Facebook_${shortcode}_${(index + 1).toString().padStart(2, '0')}",
+                description,
+                item.kind,
+                index + 1
+            )
+        }
+    }
+
+    private suspend fun resolveFacebookFallback(url: String): List<InstagramMediaItem> {
+        val form = FormBody.Builder().add("URLz", url).build()
+        val request = Request.Builder()
+            .url("https://fdown.net/download.php")
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .header("Referer", "https://fdown.net/")
+            .post(form)
+            .build()
+        return withResponse(request) { response ->
+            if (response.isSuccessful) {
+                val html = response.body?.string().orEmpty()
+                val hd = Regex("""id=["']hdlink["']\s+href=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                val sd = Regex("""id=["']sdlink["']\s+href=["']([^"']+)["']""").find(html)?.groupValues?.get(1)
+                val link = hd ?: sd
+                if (!link.isNullOrBlank()) {
+                    return@withResponse listOf(InstagramMediaItem(link.replace("&amp;", "&"), InstagramMediaKind.VIDEO))
+                }
+            }
+            resolveInstagramFallback(url)
         }
     }
 

@@ -283,7 +283,9 @@ class MainWindow(QMainWindow):
         platform_col.addWidget(label("PLATFORM", "section"))
         self.platform = QComboBox()
         for title, value in [("Deteksi otomatis", "AUTO-DETECT"), ("YouTube", "YOUTUBE"),
-                             ("Instagram", "INSTAGRAM"), ("TikTok", "TIKTOK"), ("Tautan langsung", "DIRECT LINK")]:
+                             ("Instagram", "INSTAGRAM"), ("TikTok", "TIKTOK"),
+                             ("Twitter / X", "TWITTER / X"), ("Facebook", "FACEBOOK"),
+                             ("Tautan langsung", "DIRECT LINK")]:
             self.platform.addItem(title, value)
         self.platform.setAccessibleName("Platform")
         platform_col.addWidget(self.platform)

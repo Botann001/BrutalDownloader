@@ -100,12 +100,17 @@ internal object InstagramMediaParser {
         }
     }
 
-    private fun kind(label: String): InstagramMediaKind? =
-        when (whitespace.replace(decodeEntities(label), " ").trim().lowercase(Locale.ROOT)) {
-            "download photo" -> InstagramMediaKind.PHOTO
-            "download video" -> InstagramMediaKind.VIDEO
+    private fun kind(label: String): InstagramMediaKind? {
+        val clean = whitespace.replace(decodeEntities(label), " ").trim().lowercase(Locale.ROOT)
+        return when {
+            clean == "download photo" -> InstagramMediaKind.PHOTO
+            clean == "download video" ||
+                clean == "download hd" || clean == "download sd" ||
+                clean == "download hd now" || clean == "download sd now" ||
+                clean.matches(Regex("""download\s*\(?\d+p\)?.*""")) -> InstagramMediaKind.VIDEO
             else -> null
         }
+    }
 
     private fun decodeSnapSave(payload: String, alphabet: String, offset: Int, base: Int): String {
         // The wrapper substitutes alphabet characters with decimal digits before base conversion.
