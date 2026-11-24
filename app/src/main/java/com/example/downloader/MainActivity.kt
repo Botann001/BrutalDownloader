@@ -4,21 +4,26 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
-
 import android.media.MediaExtractor
 import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-
+import android.os.VibrationEffect
+import android.os.Vibrator
+import android.view.HapticFeedbackConstants
+import android.view.MotionEvent
 import android.view.View
+import android.view.animation.OvershootInterpolator
 import android.webkit.*
 import android.widget.*
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import kotlinx.coroutines.*
 import okhttp3.FormBody
 import okhttp3.MediaType.Companion.toMediaType
@@ -26,8 +31,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
-
 import java.net.URLEncoder
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
@@ -48,6 +53,14 @@ class MainActivity : AppCompatActivity() {
     private lateinit var statusTextView: TextView
     private lateinit var previewContainer: LinearLayout
     private lateinit var extractorWebView: WebView
+    private lateinit var mainScrollView: ScrollView
+    private lateinit var impactBanner: View
+    private lateinit var bannerTitleTextView: TextView
+    private lateinit var bannerDescTextView: TextView
+    private lateinit var playMediaButton: Button
+    private lateinit var closeBannerButton: View
+    private var lastSavedMedia: SavedMedia? = null
+    private val dismissBannerRunnable = Runnable { dismissBanner() }
 
     private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var pendingAudioOnly: Boolean? = null
@@ -104,6 +117,14 @@ class MainActivity : AppCompatActivity() {
         statusTextView = findViewById(R.id.statusTextView)
         previewContainer = findViewById(R.id.previewContainer)
         extractorWebView = findViewById(R.id.extractorWebView)
+        mainScrollView = findViewById(R.id.mainScrollView)
+        impactBanner = findViewById(R.id.impactBanner)
+        bannerTitleTextView = findViewById(R.id.bannerTitleTextView)
+        bannerDescTextView = findViewById(R.id.bannerDescTextView)
+        playMediaButton = findViewById(R.id.playMediaButton)
+        closeBannerButton = findViewById(R.id.closeBannerButton)
+
+        closeBannerButton.setOnClickListener { dismissBanner() }
 
         val spinnerAdapter = ArrayAdapter(
             this,
@@ -125,7 +146,7 @@ class MainActivity : AppCompatActivity() {
 
         setupWebView()
 
-        pasteButton.setOnClickListener {
+        applySquashAndStretch(pasteButton) {
             val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             val clip = clipboard.primaryClip
             if (clip != null && clip.itemCount > 0) {
@@ -144,18 +165,22 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        clearButton.setOnClickListener {
+        applySquashAndStretch(clearButton) {
             urlEditText.text?.clear()
             previewContainer.visibility = View.GONE
             log("> Input dibersihkan. Siap menerima link.")
         }
 
-        downloadButton.setOnClickListener {
+        applySquashAndStretch(downloadButton) {
             processDownload(isAudioOnly = false)
         }
 
-        downloadAudioButton.setOnClickListener {
+        applySquashAndStretch(downloadAudioButton) {
             processDownload(isAudioOnly = true)
+        }
+
+        applySquashAndStretch(playMediaButton) {
+            lastSavedMedia?.let { openMedia(it) }
         }
     }
 
@@ -301,7 +326,11 @@ class MainActivity : AppCompatActivity() {
                 val errors = failures.joinToString("\n") { "> [!] $it" }
                 log(listOf(heading, "> Tersimpan ${saved.size}/${selected.size} file di Downloads/BrutalDownloader.", details, errors)
                     .filter { it.isNotBlank() }.joinToString("\n"))
-                Toast.makeText(this@MainActivity, "Tersimpan ${saved.size}/${selected.size} file", Toast.LENGTH_LONG).show()
+                if (saved.isNotEmpty()) {
+                    showImpactBanner(saved.last())
+                } else {
+                    Toast.makeText(this@MainActivity, "Tersimpan ${saved.size}/${selected.size} file", Toast.LENGTH_LONG).show()
+                }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -324,7 +353,12 @@ class MainActivity : AppCompatActivity() {
         val itemNumber: Int? = null
     )
 
-    private data class SavedMedia(val location: String, val format: String, val details: String)
+    private data class SavedMedia(
+        val location: String,
+        val format: String,
+        val details: String,
+        val uri: Uri? = null
+    )
 
     private suspend fun chooseInstagramItems(items: List<MediaResult>): List<MediaResult>? {
         if (items.isEmpty()) throw IOException("Tidak ada foto/video Instagram yang dapat diunduh.")
@@ -615,7 +649,17 @@ class MainActivity : AppCompatActivity() {
                                     val progress = if (contentLength > 0) {
                                         ((bytesCopied.toDouble() / contentLength) * 100).toInt().coerceIn(0, 100)
                                     } else null
-                                    if (progress != null) progressBar.progress = progress
+                                    if (progress != null) {
+                                        progressBar.progress = progress
+                                        percentTextView.animate()
+                                            .scaleX(1.18f)
+                                            .scaleY(1.18f)
+                                            .setDuration(60)
+                                            .withEndAction {
+                                                percentTextView.animate().scaleX(1.0f).scaleY(1.0f).setDuration(80).start()
+                                            }
+                                            .start()
+                                    }
                                     percentTextView.text = "$itemPosition/$itemCount " + (progress?.let { "$it%" } ?: "${bytesCopied / 1024} KB")
                                     statusTextView.text = "> ITEM $itemPosition/$itemCount: ${bytesCopied / 1024} KB\n> Format: ${format.extension.uppercase()}\n> ${media.qualityDescription}"
                                 }
@@ -632,7 +676,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     currentCoroutineContext().ensureActive()
                     val location = pending.publish()
-                    return SavedMedia(location, format.extension, actualQuality)
+                    return SavedMedia(location, format.extension, actualQuality, pending.uri)
                 }
             }
         }
@@ -708,6 +752,147 @@ class MainActivity : AppCompatActivity() {
             throw IOException("Format media tidak valid atau tidak didukung perangkat ini.", e)
         } finally {
             extractor.release()
+        }
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun applySquashAndStretch(view: View, onClick: () -> Unit) {
+        view.setOnTouchListener { v, event ->
+            when (event.action) {
+                MotionEvent.ACTION_DOWN -> {
+                    v.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                    v.animate()
+                        .scaleX(0.93f)
+                        .scaleY(0.93f)
+                        .translationY(6f)
+                        .setDuration(70)
+                        .start()
+                }
+                MotionEvent.ACTION_UP -> {
+                    v.performHapticFeedback(HapticFeedbackConstants.VIRTUAL_KEY)
+                    v.animate()
+                        .scaleX(1.0f)
+                        .scaleY(1.0f)
+                        .translationY(0f)
+                        .setInterpolator(OvershootInterpolator(3.0f))
+                        .setDuration(200)
+                        .withEndAction {
+                            if (v.isEnabled) onClick()
+                        }
+                        .start()
+                }
+                MotionEvent.ACTION_CANCEL -> {
+                    v.animate()
+                        .scaleX(1.0f)
+                        .scaleY(1.0f)
+                        .translationY(0f)
+                        .setDuration(100)
+                        .start()
+                }
+            }
+            true
+        }
+    }
+
+    private fun showImpactBanner(item: SavedMedia) {
+        lastSavedMedia = item
+        runOnUiThread {
+            bannerTitleTextView.text = "FILE BERHASIL DISIMPAN!"
+            bannerDescTextView.text = item.location
+            playMediaButton.text = if (item.format.lowercase() in listOf("mp3", "m4a", "aac")) {
+                "▶ PUTAR AUDIO SEKARANG"
+            } else {
+                "▶ PUTAR VIDEO SEKARANG"
+            }
+
+            impactBanner.visibility = View.VISIBLE
+            impactBanner.translationY = -600f
+            impactBanner.alpha = 0f
+
+            impactBanner.animate()
+                .translationY(0f)
+                .alpha(1f)
+                .setInterpolator(OvershootInterpolator(2.2f))
+                .setDuration(450)
+                .withEndAction {
+                    triggerScreenShake()
+                    triggerHapticImpact()
+                }
+                .start()
+
+            impactBanner.removeCallbacks(dismissBannerRunnable)
+            impactBanner.postDelayed(dismissBannerRunnable, 7000)
+        }
+    }
+
+    private fun dismissBanner() {
+        runOnUiThread {
+            impactBanner.animate()
+                .translationY(-600f)
+                .alpha(0f)
+                .setDuration(250)
+                .withEndAction { impactBanner.visibility = View.GONE }
+                .start()
+        }
+    }
+
+    private fun triggerScreenShake() {
+        val shake = 14f
+        mainScrollView.animate()
+            .translationY(shake)
+            .setDuration(45)
+            .withEndAction {
+                mainScrollView.animate()
+                    .translationY(-shake * 0.6f)
+                    .setDuration(40)
+                    .withEndAction {
+                        mainScrollView.animate()
+                            .translationY(0f)
+                            .setDuration(35)
+                            .start()
+                    }
+                    .start()
+            }
+            .start()
+    }
+
+    private fun triggerHapticImpact() {
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                vibrator?.vibrate(VibrationEffect.createOneShot(70, VibrationEffect.DEFAULT_AMPLITUDE))
+            } else {
+                @Suppress("DEPRECATION")
+                val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(70)
+            }
+        } catch (_: Exception) {}
+    }
+
+    private fun openMedia(item: SavedMedia) {
+        try {
+            val intent = Intent(Intent.ACTION_VIEW)
+            val ext = item.format.lowercase()
+            val mimeType = when (ext) {
+                "mp4", "mkv", "webm", "mov" -> "video/*"
+                "mp3", "m4a", "aac", "wav", "flac" -> "audio/*"
+                "jpg", "jpeg", "png", "webp", "gif" -> "image/*"
+                else -> "*/*"
+            }
+            val uri = item.uri ?: run {
+                val file = File(item.location)
+                if (file.exists()) {
+                    FileProvider.getUriForFile(this, "${applicationContext.packageName}.fileprovider", file)
+                } else {
+                    Uri.parse(item.location)
+                }
+            }
+            intent.setDataAndType(uri, mimeType)
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_ACTIVITY_NEW_TASK)
+            startActivity(Intent.createChooser(intent, "Buka Media"))
+        } catch (e: Exception) {
+            Toast.makeText(this, "Tidak dapat membuka media: ${e.message}", Toast.LENGTH_SHORT).show()
         }
     }
 }
