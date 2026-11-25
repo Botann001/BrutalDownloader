@@ -6,8 +6,13 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.media.MediaCodec
 import android.media.MediaExtractor
 import android.media.MediaFormat
+import android.media.MediaMuxer
+import org.schabi.newpipe.extractor.MediaFormat as NewPipeMediaFormat
+import org.schabi.newpipe.extractor.NewPipe
+import org.schabi.newpipe.extractor.ServiceList
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -64,6 +69,8 @@ class MainActivity : AppCompatActivity() {
 
     private val downloadScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     private var pendingAudioOnly: Boolean? = null
+    @Volatile
+    private var newPipeInitialized = false
 
     private val platformOptions = arrayOf(
         "AUTO-DETECT",
@@ -362,7 +369,8 @@ class MainActivity : AppCompatActivity() {
         val fileStem: String,
         val qualityDescription: String,
         val kind: InstagramMediaKind? = null,
-        val itemNumber: Int? = null
+        val itemNumber: Int? = null,
+        val audioDownloadUrl: String? = null
     )
 
     private data class SavedMedia(
@@ -774,72 +782,123 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private suspend fun resolveYouTube(url: String, isAudio: Boolean, resolution: String): MediaResult {
-        val videoId = when {
-            url.contains("youtu.be/") -> url.substringAfter("youtu.be/").substringBefore("?").substringBefore("/")
-            url.contains("youtube.com/shorts/") -> url.substringAfter("shorts/").substringBefore("?").substringBefore("/")
-            url.contains("v=") -> url.substringAfter("v=").substringBefore("&")
-            else -> throw IOException("Tautan YouTube tidak valid")
+    @Synchronized
+    private fun ensureNewPipeInitialized() {
+        if (!newPipeInitialized) {
+            NewPipe.init(NewPipeDownloader(client))
+            newPipeInitialized = true
         }
+    }
+
+    private suspend fun resolveYouTube(url: String, isAudio: Boolean, resolution: String): MediaResult {
+        val videoId = YouTubeStreamParser.extractVideoId(url)
+            ?: throw IOException("Tautan YouTube tidak valid")
+        val targetHeight = when {
+            resolution.contains("BEST") -> null
+            resolution.contains("720") -> 720
+            resolution.contains("480") -> 480
+            else -> 360
+        }
+        val errors = mutableListOf<String>()
+
+        // 1. Primary: Direct on-device extraction via NewPipeExtractor
+        try {
+            currentCoroutineContext().ensureActive()
+            ensureNewPipeInitialized()
+            val watchUrl = "https://www.youtube.com/watch?v=$videoId"
+            val extractor = ServiceList.YouTube.getStreamExtractor(watchUrl)
+            extractor.fetchPage()
+
+            val muxedVideos = extractor.videoStreams.mapNotNull { stream ->
+                if (!stream.isUrl || stream.content.isBlank()) return@mapNotNull null
+                val fmt = stream.format ?: return@mapNotNull null
+                if (fmt != NewPipeMediaFormat.MPEG_4) return@mapNotNull null
+                val height = Regex("(\\d+)").find(stream.getResolution())?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                if (height > 0) YouTubeCandidate(height, stream.content, stream.bitrate.toLong(), isH264 = true) else null
+            }
+
+            val adaptiveVideos = extractor.videoOnlyStreams.mapNotNull { stream ->
+                if (!stream.isUrl || stream.content.isBlank()) return@mapNotNull null
+                val fmt = stream.format ?: return@mapNotNull null
+                if (fmt != NewPipeMediaFormat.MPEG_4) return@mapNotNull null
+                val codecStr = stream.codec.orEmpty().lowercase()
+                if (codecStr.contains("av01")) return@mapNotNull null
+                val height = Regex("(\\d+)").find(stream.getResolution())?.groupValues?.get(1)?.toIntOrNull() ?: 0
+                val isH264 = codecStr.contains("avc1") || (!codecStr.contains("vp9") && !codecStr.contains("vp09"))
+                if (height > 0) YouTubeCandidate(height, stream.content, stream.bitrate.toLong(), isH264 = isH264) else null
+            }
+
+            val audioStreams = extractor.audioStreams.mapNotNull { stream ->
+                if (!stream.isUrl || stream.content.isBlank()) return@mapNotNull null
+                val fmt = stream.format ?: return@mapNotNull null
+                val isM4a = fmt == NewPipeMediaFormat.M4A
+                if (!isM4a && fmt != NewPipeMediaFormat.WEBMA && fmt != NewPipeMediaFormat.WEBMA_OPUS) {
+                    return@mapNotNull null
+                }
+                YouTubeAudioCandidate(stream.content, stream.averageBitrate.toLong(), isM4a = isM4a)
+            }
+
+            val resolved = YouTubeStreamParser.selectStream(
+                muxedVideos = muxedVideos,
+                adaptiveVideos = adaptiveVideos,
+                audioStreams = audioStreams,
+                isAudioOnly = isAudio,
+                targetHeight = targetHeight
+            )
+            val stem = if (isAudio) "YouTube_Audio_$videoId" else "YouTube_$videoId"
+            return MediaResult(
+                downloadUrl = resolved.videoUrl,
+                fileStem = stem,
+                qualityDescription = resolved.description,
+                audioDownloadUrl = resolved.audioUrl
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            currentCoroutineContext().ensureActive()
+            errors.add("Direct: ${e.message ?: e::class.java.simpleName}")
+        }
+
+        // 2. Fallback: Live Invidious instances (supporting local=true proxy & adaptive muxing)
         val instances = arrayOf(
             "https://yt.chocolatemoo53.com",
-            "https://invidious.nerdvpn.de",
-            "https://inv.tux.pizza",
-            "https://invidious.jing.rocks"
+            "https://inv.nadeko.net",
+            "https://yewtu.be"
         )
-        var lastFailure: Exception? = null
         for (host in instances) {
             currentCoroutineContext().ensureActive()
             try {
-                val req = Request.Builder().url("$host/api/v1/videos/$videoId").build()
-                withResponse(req) { response ->
-                    if (!response.isSuccessful) throw IOException("HTTP ${response.code} dari $host")
-                    val json = JSONObject(response.body?.string() ?: throw IOException("Respons kosong"))
-                    val formats = json.optJSONArray(if (isAudio) "adaptiveFormats" else "formatStreams")
-                        ?: throw IOException("Daftar stream tidak tersedia dari $host")
-                    val candidates = (0 until formats.length()).map { formats.getJSONObject(it) }
-                        .filter { it.optString("url").isNotBlank() }
-                    if (isAudio) {
-                        val audio = candidates.filter {
-                            it.optString("type").startsWith("audio/mp4") ||
-                                it.optString("type").startsWith("audio/webm") ||
-                                it.optString("container") == "m4a"
-                        }.maxByOrNull { it.optLong("bitrate", 0) }
-                            ?: throw IOException("Audio terpisah tidak tersedia dari $host; video tidak akan disimpan sebagai MP3.")
-                        return MediaResult(audio.getString("url"), "YouTube_Audio_$videoId", "Audio asli; bukan konversi MP3.")
-                    }
-                    val videos = candidates.mapNotNull { item ->
-                        val type = item.optString("type")
-                        val container = item.optString("container")
-                        val height = Regex("(\\d+)p").find(item.optString("qualityLabel"))
-                            ?.groupValues?.get(1)?.toIntOrNull() ?: item.optInt("height", 0)
-                        if (height > 0 && (type.startsWith("video/mp4") || container == "mp4")) {
-                            height to item.getString("url")
-                        } else null
-                    }
-                    val targetHeight = when {
-                        resolution.contains("BEST") -> null
-                        resolution.contains("720") -> 720
-                        resolution.contains("480") -> 480
-                        else -> 360
-                    }
-                    val selectedHeight = MediaDownloadPolicy.selectVideoHeight(videos.map { it.first }, targetHeight)
-                    val selectedUrl = videos.first { it.first == selectedHeight }.second
-                    val description = if (targetHeight != null && selectedHeight != targetHeight) {
-                        "${targetHeight}p tidak tersedia; memilih ${selectedHeight}p menurut metadata sumber."
-                    } else {
-                        "Memilih ${selectedHeight}p menurut metadata sumber; resolusi aktual akan diverifikasi."
-                    }
-                    return MediaResult(selectedUrl, "YouTube_$videoId", description)
+                val req = Request.Builder()
+                    .url("$host/api/v1/videos/$videoId")
+                    .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+                    .build()
+                return withResponse(req) { response ->
+                    if (!response.isSuccessful) throw IOException("HTTP ${response.code}")
+                    val body = response.body?.string() ?: throw IOException("Respons kosong")
+                    val resolved = YouTubeStreamParser.parseInvidiousResponse(
+                        host = host,
+                        videoId = videoId,
+                        jsonBody = body,
+                        isAudioOnly = isAudio,
+                        targetHeight = targetHeight
+                    )
+                    val stem = if (isAudio) "YouTube_Audio_$videoId" else "YouTube_$videoId"
+                    MediaResult(
+                        downloadUrl = resolved.videoUrl,
+                        fileStem = stem,
+                        qualityDescription = resolved.description,
+                        audioDownloadUrl = resolved.audioUrl
+                    )
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
                 currentCoroutineContext().ensureActive()
-                lastFailure = e
+                val label = host.removePrefix("https://")
+                errors.add("$label: ${e.message ?: e::class.java.simpleName}")
             }
         }
-        throw IOException("Gagal mengekstrak YouTube: ${lastFailure?.message ?: "stream tidak tersedia"}", lastFailure)
+        throw IOException("Gagal mengekstrak YouTube (${errors.joinToString("; ")})")
     }
 
     private suspend inline fun <T> withResponse(request: Request, block: (okhttp3.Response) -> T): T {
@@ -866,6 +925,9 @@ class MainActivity : AppCompatActivity() {
         itemPosition: Int,
         itemCount: Int
     ): SavedMedia {
+        if (!audioOnly && !media.audioDownloadUrl.isNullOrBlank()) {
+            return downloadAndMuxStream(media, media.audioDownloadUrl, itemPosition, itemCount)
+        }
         val request = Request.Builder()
             .url(media.downloadUrl)
             .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
@@ -949,6 +1011,220 @@ class MainActivity : AppCompatActivity() {
                     return SavedMedia(location, format.extension, actualQuality, pending.uri)
                 }
             }
+        }
+    }
+
+    private suspend fun downloadAndMuxStream(
+        media: MediaResult,
+        audioUrl: String,
+        itemPosition: Int,
+        itemCount: Int
+    ): SavedMedia {
+        val tempId = java.util.UUID.randomUUID().toString()
+        val videoTemp = File(cacheDir, "mux_v_$tempId.mp4")
+        val audioTemp = File(cacheDir, "mux_a_$tempId.m4a")
+        val muxedTemp = File(cacheDir, "mux_out_$tempId.mp4")
+        try {
+            downloadToTempFile(
+                url = media.downloadUrl,
+                dest = videoTemp,
+                audioOnly = false,
+                stageLabel = "VIDEO",
+                progressStart = 0,
+                progressSpan = 65,
+                media = media,
+                itemPosition = itemPosition,
+                itemCount = itemCount
+            )
+            downloadToTempFile(
+                url = audioUrl,
+                dest = audioTemp,
+                audioOnly = true,
+                stageLabel = "AUDIO",
+                progressStart = 65,
+                progressSpan = 25,
+                media = media,
+                itemPosition = itemPosition,
+                itemCount = itemCount
+            )
+
+            currentCoroutineContext().ensureActive()
+            withContext(Dispatchers.Main) {
+                progressBar.isIndeterminate = true
+                percentTextView.text = "MUXING MP4..."
+                statusTextView.text = "> ITEM $itemPosition/$itemCount: Menggabungkan video & audio...\n> ${media.qualityDescription}"
+            }
+            muxMp4Tracks(videoTemp, audioTemp, muxedTemp)
+
+            currentCoroutineContext().ensureActive()
+            val mp4Format = DownloadFormat("mp4", "video/mp4")
+            DownloadStorage(this@MainActivity).create("${media.fileStem}.mp4", mp4Format.mimeType).use { pending ->
+                pending.outputStream.use { output ->
+                    muxedTemp.inputStream().use { input ->
+                        val buffer = ByteArray(16 * 1024)
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+                            val count = input.read(buffer)
+                            if (count == -1) break
+                            output.write(buffer, 0, count)
+                        }
+                    }
+                }
+                withContext(Dispatchers.Main) { percentTextView.text = "VALIDATING..." }
+                val actualQuality = validateMedia(pending.uri, mp4Format, audioOnly = false)
+                currentCoroutineContext().ensureActive()
+                val location = pending.publish()
+                return SavedMedia(location, mp4Format.extension, actualQuality, pending.uri)
+            }
+        } finally {
+            videoTemp.delete()
+            audioTemp.delete()
+            muxedTemp.delete()
+        }
+    }
+
+    private suspend fun downloadToTempFile(
+        url: String,
+        dest: File,
+        audioOnly: Boolean,
+        stageLabel: String,
+        progressStart: Int,
+        progressSpan: Int,
+        media: MediaResult,
+        itemPosition: Int,
+        itemCount: Int
+    ) {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+            .build()
+        withResponse(request) { response ->
+            if (response.code != 200 && response.code != 206) {
+                throw IOException("HTTP ${response.code}: stream $stageLabel tidak tersedia.")
+            }
+            val body = response.body ?: throw IOException("Respons $stageLabel kosong.")
+            val contentLength = body.contentLength()
+            body.byteStream().buffered().use { input ->
+                input.mark(4096)
+                val header = ByteArray(4096)
+                var headerSize = 0
+                while (headerSize < header.size) {
+                    currentCoroutineContext().ensureActive()
+                    val count = input.read(header, headerSize, header.size - headerSize)
+                    if (count == -1) break
+                    headerSize += count
+                }
+                input.reset()
+                MediaDownloadPolicy.detectFormat(header.copyOf(headerSize), audioOnly)
+
+                withContext(Dispatchers.Main) {
+                    progressBar.visibility = View.VISIBLE
+                    progressBar.isIndeterminate = contentLength <= 0
+                    progressBar.max = 100
+                    progressBar.progress = progressStart
+                    percentTextView.text = "$itemPosition/$itemCount $stageLabel..."
+                }
+                var bytesCopied = 0L
+                var lastUpdate = 0L
+                dest.outputStream().use { output ->
+                    val buffer = ByteArray(16 * 1024)
+                    while (true) {
+                        currentCoroutineContext().ensureActive()
+                        val count = input.read(buffer)
+                        if (count == -1) break
+                        output.write(buffer, 0, count)
+                        bytesCopied += count
+                        val now = System.currentTimeMillis()
+                        if (now - lastUpdate > 250) {
+                            lastUpdate = now
+                            withContext(Dispatchers.Main) {
+                                val pct = if (contentLength > 0) {
+                                    (progressStart + ((bytesCopied.toDouble() / contentLength) * progressSpan)).toInt().coerceIn(0, 99)
+                                } else null
+                                if (pct != null) {
+                                    progressBar.isIndeterminate = false
+                                    progressBar.progress = pct
+                                }
+                                percentTextView.text = pct?.let { "$it%" } ?: "$stageLabel ${bytesCopied / 1024} KB"
+                                statusTextView.text = "> ITEM $itemPosition/$itemCount [$stageLabel]: ${bytesCopied / 1024} KB\n> ${media.qualityDescription}"
+                            }
+                        }
+                    }
+                }
+                MediaDownloadPolicy.requireComplete(contentLength, bytesCopied)
+            }
+        }
+    }
+
+    private suspend fun muxMp4Tracks(videoFile: File, audioFile: File, outputFile: File) {
+        val videoExtractor = MediaExtractor()
+        val audioExtractor = MediaExtractor()
+        var muxer: MediaMuxer? = null
+        try {
+            videoExtractor.setDataSource(videoFile.absolutePath)
+            audioExtractor.setDataSource(audioFile.absolutePath)
+
+            val videoSrcIndex = (0 until videoExtractor.trackCount).firstOrNull {
+                videoExtractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("video/") == true
+            } ?: throw IOException("Stream video tidak berisi track video yang valid.")
+
+            val audioSrcIndex = (0 until audioExtractor.trackCount).firstOrNull {
+                audioExtractor.getTrackFormat(it).getString(MediaFormat.KEY_MIME)?.startsWith("audio/") == true
+            } ?: throw IOException("Stream audio tidak berisi track audio yang valid.")
+
+            val videoFormat = videoExtractor.getTrackFormat(videoSrcIndex)
+            val audioFormat = audioExtractor.getTrackFormat(audioSrcIndex)
+            videoExtractor.selectTrack(videoSrcIndex)
+            audioExtractor.selectTrack(audioSrcIndex)
+
+            val activeMuxer = MediaMuxer(outputFile.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
+            muxer = activeMuxer
+            val videoDstIndex = activeMuxer.addTrack(videoFormat)
+            val audioDstIndex = activeMuxer.addTrack(audioFormat)
+            activeMuxer.start()
+
+            copyMuxTrack(videoExtractor, videoFormat, activeMuxer, videoDstIndex)
+            copyMuxTrack(audioExtractor, audioFormat, activeMuxer, audioDstIndex)
+
+            activeMuxer.stop()
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: IOException) {
+            throw e
+        } catch (e: Exception) {
+            throw IOException("Gagal menggabungkan video & audio YouTube: ${e.message}", e)
+        } finally {
+            try { muxer?.release() } catch (_: Exception) {}
+            try { videoExtractor.release() } catch (_: Exception) {}
+            try { audioExtractor.release() } catch (_: Exception) {}
+        }
+    }
+
+    private suspend fun copyMuxTrack(
+        extractor: MediaExtractor,
+        format: MediaFormat,
+        muxer: MediaMuxer,
+        dstTrackIndex: Int
+    ) {
+        val maxInput = if (format.containsKey(MediaFormat.KEY_MAX_INPUT_SIZE)) {
+            format.getInteger(MediaFormat.KEY_MAX_INPUT_SIZE)
+        } else 0
+        val bufferSize = maxOf(maxInput, 512 * 1024).coerceIn(256 * 1024, 16 * 1024 * 1024)
+        val buffer = ByteBuffer.allocate(bufferSize)
+        val bufferInfo = MediaCodec.BufferInfo()
+        var lastPts = -1L
+        while (true) {
+            currentCoroutineContext().ensureActive()
+            bufferInfo.offset = 0
+            val sampleSize = extractor.readSampleData(buffer, 0)
+            if (sampleSize < 0) break
+            val pts = extractor.sampleTime.coerceAtLeast(0L)
+            bufferInfo.presentationTimeUs = if (pts > lastPts) pts else lastPts + 1L
+            lastPts = bufferInfo.presentationTimeUs
+            bufferInfo.size = sampleSize
+            bufferInfo.flags = extractor.sampleFlags
+            muxer.writeSampleData(dstTrackIndex, buffer, bufferInfo)
+            extractor.advance()
         }
     }
 
