@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import json
 import re
+import shutil
+import subprocess
+import sys
 import tempfile
 import threading
 from collections.abc import Callable
@@ -444,8 +447,21 @@ def _number(value):
     return value if isinstance(value, (int, float)) and value >= 0 else 0
 
 
-def _select_format(formats, options, log):
-    usable = []
+def _find_ffmpeg():
+    found = shutil.which('ffmpeg')
+    if found:
+        return found
+    if getattr(sys, 'frozen', False):
+        candidate = Path(sys.executable).resolve().parent / 'ffmpeg.exe'
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _select_streams(formats, options, log):
+    progressive = []
+    adaptive_videos = []
+    audio_streams = []
     for fmt in formats:
         if not isinstance(fmt, dict) or not fmt.get('url') or not fmt.get('format_id'):
             continue
@@ -458,33 +474,69 @@ def _select_format(formats, options, log):
             continue
         video = fmt.get('vcodec') not in (None, 'none')
         audio = fmt.get('acodec') not in (None, 'none')
+        ext = fmt.get('ext') or ''
         if options.audio_only:
-            if audio and fmt.get('vcodec') == 'none' and re.fullmatch(r'[a-zA-Z0-9]{1,10}', fmt.get('ext') or ''):
-                usable.append(fmt)
-        elif video and audio and fmt.get('ext') == 'mp4':
-            usable.append(fmt)
-    if not usable:
-        message = 'native audio-only HTTP stream' if options.audio_only else 'progressive MP4 stream containing both video and audio'
-        raise DownloadError(f'No {message} is available; separate streams/HLS require FFmpeg and are not used')
+            if audio and fmt.get('vcodec') == 'none' and re.fullmatch(r'[a-zA-Z0-9]{1,10}', ext):
+                audio_streams.append(fmt)
+        else:
+            if audio and fmt.get('vcodec') == 'none' and ext in ('m4a', 'mp4', 'aac'):
+                audio_streams.append(fmt)
+            elif video and audio and ext == 'mp4':
+                progressive.append(fmt)
+            elif video and not audio and ext == 'mp4':
+                vcodec = str(fmt.get('vcodec') or '').lower()
+                if not vcodec.startswith('av01'):
+                    adaptive_videos.append(fmt)
+
     if options.audio_only:
-        return max(usable, key=lambda f: (_number(f.get('abr') or f.get('tbr')), _number(f.get('asr'))))
-    known = [f for f in usable if _number(f.get('height'))]
+        if not audio_streams:
+            raise DownloadError('No native audio-only HTTP stream is available; separate streams/HLS require FFmpeg and are not used')
+        return max(audio_streams, key=lambda f: (_number(f.get('abr') or f.get('tbr')), _number(f.get('asr')))), None
+
+    ffmpeg_path = _find_ffmpeg()
+    best_m4a = max(audio_streams, key=lambda f: (_number(f.get('abr') or f.get('tbr')), _number(f.get('asr'))), default=None)
+    can_merge = bool(ffmpeg_path and best_m4a and adaptive_videos)
+    video_pool = progressive + (adaptive_videos if can_merge else [])
+
+    if not video_pool:
+        raise DownloadError('No progressive MP4 stream containing both video and audio is available; separate streams/HLS require FFmpeg and are not used')
+
+    known = [f for f in video_pool if _number(f.get('height'))]
     if options.quality == 'BEST':
-        selected = max(usable, key=lambda f: (_number(f.get('height')), _number(f.get('tbr'))))
-        actual = f"{selected['height']}p" if selected.get('height') else 'unknown height'
-        log(f'BEST: using best available progressive MP4 ({actual}, audio included), not separate streams.')
-        return selected
-    target = int(options.quality)
-    below = [f for f in known if f['height'] <= target]
-    if below:
-        selected = max(below, key=lambda f: (f['height'], _number(f.get('tbr'))))
-    elif known:
-        selected = min(known, key=lambda f: (f['height'], -_number(f.get('tbr'))))
+        selected_height = _number(max(video_pool, key=lambda f: (_number(f.get('height')), _number(f.get('tbr')))).get('height'))
     else:
-        selected = max(usable, key=lambda f: _number(f.get('tbr')))
-    if selected.get('height') != target:
+        target = int(options.quality)
+        below = [f for f in known if f['height'] <= target]
+        if below:
+            selected_height = max(f['height'] for f in below)
+        elif known:
+            selected_height = min(f['height'] for f in known)
+        else:
+            selected_height = 0
+
+    progressive_at_height = [f for f in progressive if _number(f.get('height')) == selected_height]
+    if progressive_at_height:
+        selected = max(progressive_at_height, key=lambda f: _number(f.get('tbr')))
         actual = f"{selected['height']}p" if selected.get('height') else 'unknown height'
-        log(f'Requested {target}p unavailable as progressive MP4; using {actual} without FFmpeg.')
+        if options.quality == 'BEST':
+            log(f'BEST: using best available progressive MP4 ({actual}, audio included), not separate streams.')
+        elif selected.get('height') != int(options.quality):
+            log(f'Requested {int(options.quality)}p unavailable as progressive MP4; using {actual} without FFmpeg.')
+        return selected, None
+
+    if can_merge:
+        adaptive_at_height = [f for f in adaptive_videos if _number(f.get('height')) == selected_height] or adaptive_videos
+        h264 = [f for f in adaptive_at_height if str(f.get('vcodec') or '').lower().startswith('avc')]
+        selected_video = max(h264 or adaptive_at_height, key=lambda f: (_number(f.get('height')), _number(f.get('tbr'))))
+        actual = f"{selected_video['height']}p" if selected_video.get('height') else 'unknown height'
+        log(f'Muxing {actual} MP4 video + M4A audio via FFmpeg (no progressive stream at {actual}).')
+        return selected_video, best_m4a
+
+    raise DownloadError('No progressive MP4 stream containing both video and audio is available; separate streams/HLS require FFmpeg and are not used')
+
+
+def _select_format(formats, options, log):
+    selected, _ = _select_streams(formats, options, log)
     return selected
 
 
@@ -517,6 +569,9 @@ def _ydl_options(options, cancel, log, hook=None, stage=None) -> Any:
         'progress_hooks': [hook] if hook else [lambda _: _check(cancel)],
         'check_formats': False,
     }
+    node_path = shutil.which('node')
+    if node_path:
+        params['js_runtimes'] = {'node': {'path': node_path}}
     if stage is not None:
         params['outtmpl'] = str(stage / 'media.%(ext)s')
     return params
@@ -635,12 +690,53 @@ def _download_direct(options, item, stage, cancel, report, log):
     return path, extension
 
 
+def _download_ytdlp_single(ydl, entry, fmt, stage, cancel):
+    download_info: Any = dict(entry)
+    download_info.pop('requested_formats', None)
+    download_info.pop('requested_downloads', None)
+    download_info.update(fmt)
+    ydl.process_info(download_info)
+    _check(cancel)
+    path = Path(ydl.prepare_filename(download_info))
+    if path.parent.resolve() != stage.resolve() or not path.is_file():
+        raise DownloadError('yt-dlp did not produce the expected media file')
+    return path
+
+
+def _merge_ffmpeg(video_path: Path, audio_path: Path, output_path: Path, cancel):
+    _check(cancel)
+    ffmpeg_path = _find_ffmpeg()
+    if not ffmpeg_path:
+        raise DownloadError('FFmpeg is required to merge video and audio streams')
+    flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+    result = subprocess.run(
+        [
+            ffmpeg_path, '-y', '-loglevel', 'error',
+            '-i', str(video_path), '-i', str(audio_path),
+            '-c', 'copy', '-movflags', '+faststart', str(output_path),
+        ],
+        capture_output=True,
+        text=True,
+        creationflags=flags,
+        timeout=120,
+    )
+    _check(cancel)
+    if result.returncode != 0 or not output_path.is_file():
+        detail = (result.stderr or '').strip() or f'exit code {result.returncode}'
+        raise DownloadError(f'FFmpeg merge failed: {detail}')
+
+
 def _download_ytdlp(options, item, stage, cancel, report, log):
+    phase_start = 0
+    phase_span = 100
+
     def hook(status):
         _check(cancel)
         total = status.get('total_bytes') or status.get('total_bytes_estimate') or 0
         done = status.get('downloaded_bytes') or 0
-        report(min(99, int(done * 100 / total)) if total else 0)
+        pct = (done * phase_span / total) if total else 0
+        report(min(99, int(phase_start + pct)))
+
     with yt_dlp.YoutubeDL(_ydl_options(options, cancel, log, hook, stage)) as ydl:
         info = ydl.extract_info(item.url, download=False)
         _check(cancel)
@@ -648,20 +744,34 @@ def _download_ytdlp(options, item, stage, cancel, report, log):
         if not 1 <= item.index <= len(entries):
             raise DownloadError('Media carousel changed since inspection; inspect again')
         entry = entries[item.index - 1]
-        selected = _select_format(entry.get('formats') or [entry], options, log)
-        # process_info receives exactly one self-contained stream, never a merge.
-        download_info: Any = dict(entry)
-        download_info.pop('requested_formats', None)
-        download_info.pop('requested_downloads', None)
-        download_info.update(selected)
-        ydl.process_info(download_info)
-        _check(cancel)
-        path = Path(ydl.prepare_filename(download_info))
-        if path.parent.resolve() != stage.resolve() or not path.is_file():
-            raise DownloadError('yt-dlp did not produce the expected media file')
-        with path.open('rb') as source:
-            _validate_media(source.read(4096), expected=item.kind, extension=selected['ext'])
-        return path, selected['ext']
+        selected_video, selected_audio = _select_streams(entry.get('formats') or [entry], options, log)
+        if selected_audio is None:
+            path = _download_ytdlp_single(ydl, entry, selected_video, stage, cancel)
+            with path.open('rb') as source:
+                _validate_media(source.read(4096), expected=item.kind, extension=selected_video['ext'])
+            return path, selected_video['ext']
+
+        phase_span = 70
+        video_raw = _download_ytdlp_single(ydl, entry, selected_video, stage, cancel)
+        video_path = stage / f'video.{selected_video["ext"]}'
+        video_raw.replace(video_path)
+        with video_path.open('rb') as source:
+            _validate_media(source.read(4096), expected='video', extension=selected_video['ext'])
+
+        phase_start = 70
+        phase_span = 25
+        audio_raw = _download_ytdlp_single(ydl, entry, selected_audio, stage, cancel)
+        audio_path = stage / f'audio.{selected_audio["ext"]}'
+        audio_raw.replace(audio_path)
+        with audio_path.open('rb') as source:
+            _validate_media(source.read(4096), expected='audio', extension=selected_audio['ext'])
+
+        report(96)
+        merged_path = stage / 'merged.mp4'
+        _merge_ffmpeg(video_path, audio_path, merged_path, cancel)
+        with merged_path.open('rb') as source:
+            _validate_media(source.read(4096), expected='video', extension='mp4')
+        return merged_path, 'mp4'
 
 
 def download_media(options: DownloadOptions, items: list[MediaItem], cancel: threading.Event,

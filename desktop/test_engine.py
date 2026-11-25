@@ -703,6 +703,43 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(engine._safe_name('a/b\\c:d?e*f<g>h|i\x00'), 'a_b_c_d_e_f_g_h_i_')
         self.assertLessEqual(len(engine._safe_name('x' * 300)), 120)
 
+    def test_adaptive_mp4_plus_m4a_merges_when_ffmpeg_available(self):
+        formats = [
+            fmt('137', 1080, ext='mp4', video='avc1.640028', audio='none', bitrate=2400),
+            fmt('140', None, ext='m4a', video='none', audio='mp4a.40.2', bitrate=128),
+        ]
+        with patch('engine._find_ffmpeg', return_value=None):
+            with self.assertRaisesRegex(engine.DownloadError, 'FFmpeg'):
+                engine._select_streams(formats, self.options(), self.log)
+
+        with patch('engine._find_ffmpeg', return_value='ffmpeg.exe'):
+            video_fmt, audio_fmt = engine._select_streams(formats, self.options(), self.log)
+        self.assertEqual(video_fmt['format_id'], '137')
+        assert audio_fmt is not None
+        self.assertEqual(audio_fmt['format_id'], '140')
+
+        info = {'id': 'adapt', 'title': 'AdaptiveTest', 'formats': formats}
+        ydl = self.fake_ydl(info, payload=MP4)
+
+        def fake_process(download_info):
+            Path(ydl.prepare_filename(download_info)).write_bytes(
+                M4A if download_info.get('format_id') == '140' else MP4
+            )
+
+        ydl.process_info.side_effect = fake_process
+
+        def fake_merge(video_path, audio_path, output_path, cancel):
+            self.assertTrue(video_path.is_file())
+            self.assertTrue(audio_path.is_file())
+            output_path.write_bytes(MP4)
+
+        with patch('engine._find_ffmpeg', return_value='ffmpeg.exe'), patch(
+                'engine._merge_ffmpeg', side_effect=fake_merge) as merge_mock:
+            result = self.download([self.item(kind='video', source='ytdlp', url='https://youtu.be/adapt')])
+        merge_mock.assert_called_once()
+        self.assertEqual(result[0].suffix, '.mp4')
+        self.assertEqual(result[0].read_bytes(), MP4)
+
 
 REAL_SEND = requests.Session.send
 REAL_YDL = yt_dlp.YoutubeDL
